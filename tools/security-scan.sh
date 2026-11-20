@@ -11,7 +11,8 @@ if [[ "$#" -gt 1 || ( "$mode" != all && "$mode" != staged && "$mode" != history 
   exit 2
 fi
 
-scanner="$repo/.git/simstim-security/gitleaks"
+git_dir="$(git rev-parse --git-path simstim-security/gitleaks)"
+scanner="$(cd "$(dirname "$git_dir")" && pwd)/$(basename "$git_dir")"
 if [[ ! -x "$scanner" ]]; then
   echo "security scan: pinned Gitleaks missing; run python3 tools/security-install-gitleaks.py" >&2
   exit 2
