@@ -105,7 +105,11 @@ def run(args):
             item["status"] = "pending"
             item["cue_event"] = None
             item["retrieved_at"] = None
-            item.pop("request_event", None)
+            # A deliberate retry authorizes one fresh consumer claim. Remove
+            # every prior tap receipt so the real tap reader can see it again.
+            for marker in ("tap_consumed_at", "tap_request_id", "request_event",
+                           "cued_at", "cue_session_id"):
+                item.pop(marker, None)
             _save(state_path, data)
             print(json.dumps({"status": "pending_for_deliberate_retry", "id": key})); return 0
 
