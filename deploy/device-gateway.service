@@ -1,0 +1,21 @@
+[Unit]
+Description=Portable authenticated device gateway
+After=network.target bluetooth.service
+Wants=bluetooth.service
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/device-gateway/environment
+WorkingDirectory=%h/device-gateway
+ExecStart=/usr/bin/python3 ble-fallback/host/dual_transport_daemon.py --adapter ${GATEWAY_BLUEZ_ADAPTER:-/org/bluez/hci0} --key ${SIMSTIM_KEY_PATH} --operator-socket ${SIMSTIM_OPERATOR_SOCKET}
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/device-gateway
+
+[Install]
+WantedBy=multi-user.target

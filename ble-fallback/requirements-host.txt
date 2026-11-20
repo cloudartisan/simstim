@@ -1,0 +1,4 @@
+# Optional BlueZ transport dependency. The Wi-Fi gateway/CLI does not need it.
+dbus-next==0.2.3
+# Optional USB tap refresh dependency.
+pyserial==3.5
