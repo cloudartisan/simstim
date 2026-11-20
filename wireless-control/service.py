@@ -95,7 +95,7 @@ class Control:
         self.state_path=Path(state_path or tap_refresh.DEFAULT_STATE)
         self.lock=threading.Lock(); self.current=None; self.connected=False; self.peer="none"
         self.device_id=None; self.uptime=None; self.last_touch=None; self.last_prox=None
-        self.expected=None
+        self.expected: str | None = None
         self.last_event=None; self.started=time.monotonic(); self.pending=queue.Queue(maxsize=8)
         self.last_ble_diagnostic=None; self.voice=None
     def status(self):
