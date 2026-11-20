@@ -29,7 +29,11 @@ def main() -> int:
         raise SystemExit(f"Unsupported platform for pinned Gitleaks: {platform.system()}/{platform.machine()}")
 
     repo = Path(__file__).resolve().parents[1]
-    destination = repo / ".git" / "simstim-security" / "gitleaks"
+    git_path = subprocess.check_output(
+        ["git", "rev-parse", "--git-path", "simstim-security/gitleaks"],
+        cwd=repo, text=True,
+    ).strip()
+    destination = (repo / git_path).resolve()
     if destination.exists():
         try:
             output = subprocess.check_output([str(destination), "version"], text=True).strip()

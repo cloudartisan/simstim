@@ -95,6 +95,7 @@ class Control:
         self.state_path=Path(state_path or tap_refresh.DEFAULT_STATE)
         self.lock=threading.Lock(); self.current=None; self.connected=False; self.peer="none"
         self.device_id=None; self.uptime=None; self.last_touch=None; self.last_prox=None
+        self.expected: str | None = None
         self.last_event=None; self.started=time.monotonic(); self.pending=queue.Queue(maxsize=8)
         self.last_ble_diagnostic=None; self.voice=None
     def status(self):
@@ -165,7 +166,9 @@ class Control:
                 except TimeoutError:continue
                 m=BANNER.fullmatch(line)
                 if m:
-                    if getattr(self,'expected',m.group(1))!=m.group(1):raise WirelessError('unexpected device ELF')
+                    expected=getattr(self,"expected",None)
+                    if expected is not None and (not re.fullmatch(r"[0-9a-fA-F]{64}",expected) or expected.lower()!=m.group(1).lower()):
+                        raise WirelessError('unexpected device ELF')
                     self.device_id=m.group(1); self.uptime=int(m.group(2)); self.peer=IDENTITY; self.connected=True; break
             else: raise WirelessError("exact ready banner not observed")
             while True:

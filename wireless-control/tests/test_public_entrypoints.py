@@ -79,6 +79,60 @@ class PublicEntryPointTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):peer.connect(sock)
             th.join(2);sock.close();peer.close();listener.close()
             self.assertEqual(result,["rejected"])
+    def test_optional_elf_pin_accepts_only_valid_banner_after_real_tls_authentication(self):
+        key=bytes(range(32))
+        digest="b"*64
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as d:
+            p=Path(d)/"key";p.write_bytes(key);p.chmod(0o600)
+            listener,tls=test_listener(p);control=service.Control();control.expected=None
+            rejected=[]
+            def serve():
+                s,_=listener.accept();stream=tls.wrap(s)
+                try:control.session(stream)
+                except Exception as exc:rejected.append(exc)
+                stream.close();s.close()
+            th=threading.Thread(target=serve);th.start()
+            peer=SimulatedPSKPeer(key,service.IDENTITY);sock=socket.create_connection(listener.getsockname());peer.connect(sock)
+            peer.write((f"SIMSTIM_STANDALONE sha256={digest} uptime_s=9 board_ready=1\n").encode())
+            import time
+            until=time.monotonic()+2
+            while not control.connected and time.monotonic()<until: time.sleep(.005)
+            self.assertTrue(control.connected)
+            self.assertEqual(control.device_id,digest)
+            sock.close();peer.close();listener.close();th.join(2)
+
+    def test_configured_elf_pin_and_malformed_banners_still_reject_over_real_tls(self):
+        key=bytes(range(32))
+        for expected,banner,accepted in [
+            ("a"*64,"a"*64,True),
+            ("a"*64,"b"*64,False),
+            (None,"not-a-digest",False),
+            ("not-a-digest","a"*64,False),
+        ]:
+            with self.subTest(expected=expected,banner=banner), tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as d:
+                p=Path(d)/"key";p.write_bytes(key);p.chmod(0o600)
+                listener,tls=test_listener(p);control=service.Control();control.expected=expected
+                errors=[]
+                def serve():
+                    s,_=listener.accept();stream=tls.wrap(s)
+                    try:control.session(stream)
+                    except Exception as exc:errors.append(exc)
+                    stream.close();s.close()
+                th=threading.Thread(target=serve);th.start()
+                peer=SimulatedPSKPeer(key,service.IDENTITY);sock=socket.create_connection(listener.getsockname());peer.connect(sock)
+                peer.write((f"SIMSTIM_STANDALONE sha256={banner} uptime_s=9 board_ready=1\n").encode())
+                import time
+                if accepted:
+                    until=time.monotonic()+2
+                    while not control.connected and time.monotonic()<until: time.sleep(.005)
+                else:
+                    sock.close()
+                    th.join(2)
+                self.assertEqual(control.connected,accepted)
+                if not accepted:self.assertTrue(errors)
+                if sock.fileno() >= 0:sock.close()
+                peer.close();listener.close();th.join(2)
+
     def test_operator_motor_command_roundtrip_over_real_tls_entrypoint(self):
         key=bytes(range(32))
         with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as d:

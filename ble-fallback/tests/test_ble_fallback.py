@@ -93,6 +93,7 @@ class BleFallbackTests(unittest.IsolatedAsyncioTestCase):
             key_path.write_bytes(key)
             key_path.chmod(0o600)
             control = service.Control(Path(d) / "state.json")
+            control.expected = None
             owner = Owner()
             await owner.acquire("synthetic-device")
             uplink, downlink = BoundedByteQueue(), BoundedByteQueue()
