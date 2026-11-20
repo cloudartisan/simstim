@@ -1,0 +1,52 @@
+#!/bin/sh
+# Review only: never switch, merge, build or deploy.
+set -eu
+
+fail() {
+    printf 'check-upstream: %s\n' "$*" >&2
+    exit 1
+}
+
+[ "$#" -eq 1 ] || fail 'usage: check-upstream <full deployed commit SHA>'
+pin=$1
+case "$pin" in
+    ''|*[!0-9a-f]*) fail 'pin must be a full lowercase commit SHA' ;;
+esac
+
+# Do not allow ambient Git variables to redirect operations into another repo.
+for var in $(git rev-parse --local-env-vars); do
+    unset "$var"
+done
+export GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1
+[ -d .git ] && [ ! -L .git ] || fail 'run at the root of a standalone verification clone'
+root=$(git rev-parse --show-toplevel) || fail 'not a verification worktree'
+[ "$root" = "$(pwd -P)" ] || fail 'run at the root of the verification clone'
+if git symbolic-ref --quiet HEAD >/dev/null; then
+    fail 'verification HEAD must be detached; never run this in the deploy tree'
+fi
+[ "$(git rev-parse --is-shallow-repository)" = false ] || fail 'use a full, non-shallow clone'
+dirty=$(git status --porcelain=v1 --untracked-files=all --ignored=matching --ignore-submodules=none) || fail 'cannot inspect verification checkout'
+[ -z "$dirty" ] || fail 'verification checkout is dirty (including untracked or ignored files)'
+
+# Equality rejects abbreviations, tags and an SHA of any non-commit object.
+base=$(git rev-parse --verify --quiet "$pin^{commit}") || fail 'pinned commit is not available locally'
+[ "$base" = "$pin" ] || fail 'pin must be a full commit SHA'
+git remote get-url origin >/dev/null || fail 'verification clone needs a trusted origin remote'
+
+# No destination ref or configured ref mapping: only objects and FETCH_HEAD.
+# Never report old FETCH_HEAD if fetching main failed.
+git fetch --no-tags --no-prune --no-prune-tags --no-recurse-submodules \
+    --no-auto-maintenance --no-write-commit-graph --write-fetch-head --refmap= \
+    -- origin refs/heads/main || fail 'fetch of origin main failed; no candidate'
+candidate=$(git rev-parse --verify FETCH_HEAD^{commit}) || fail 'cannot resolve fetched main'
+git merge-base --is-ancestor "$base" "$candidate" || fail 'pinned commit is not an ancestor of fetched main; stop and investigate'
+
+printf 'Pinned:    %s\nCandidate: %s\n' "$base" "$candidate"
+if [ "$base" = "$candidate" ]; then
+    printf 'No incoming changes.\n'
+else
+    printf '\nIncoming commits:\n'
+    git --no-pager log --no-show-signature --format='%h %s' "$base..$candidate" --
+    printf '\nChanged paths (net):\n'
+    git --no-pager diff --no-ext-diff --no-textconv --name-status --no-renames "$base" "$candidate" --
+fi
