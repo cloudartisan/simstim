@@ -6,6 +6,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+from tap_refresh import public_summary
+
 
 CLI = Path(__file__).with_name("attention_broker.py")
 
@@ -61,6 +64,44 @@ class BrokerE2E(unittest.TestCase):
                          "Build complete; 12 checks passed.")
         self.assertEqual(self.cli("tap", "--event-file", touch)["reason"], "replay")
         self.assertEqual(json.loads(self.state.read_text())["items"]["result-1"]["status"], "retrieved")
+
+    def test_explicit_retry_releases_real_tap_claim_once(self):
+        self.assertEqual(self.put()["status"], "stored")
+        self.assertEqual(public_summary(self.state, "11111111", self.now),
+                         ("result-1", "Build complete; 12 checks passed."))
+        first = json.loads(self.state.read_text())["items"]["result-1"]
+        self.assertEqual(first["status"], "retrieved")
+        self.assertEqual(first["tap_request_id"], "11111111")
+
+        self.assertEqual(self.cli("retry", "--id", "result-1")["status"],
+                         "pending_for_deliberate_retry")
+        retried = json.loads(self.state.read_text())["items"]["result-1"]
+        self.assertEqual(retried["status"], "pending")
+        self.assertIsNone(retried["retrieved_at"])
+        self.assertFalse({"tap_consumed_at", "tap_request_id", "cued_at",
+                          "cue_session_id"} & retried.keys())
+
+        self.assertEqual(public_summary(self.state, "22222222", self.now),
+                         ("result-1", "Build complete; 12 checks passed."))
+        self.assertEqual(public_summary(self.state, "33333333", self.now), (None, None))
+        final = json.loads(self.state.read_text())["items"]["result-1"]
+        self.assertEqual(final["status"], "retrieved")
+        self.assertEqual(final["tap_request_id"], "22222222")
+
+    def test_rejected_retry_does_not_mutate_state(self):
+        self.put()
+        before = self.state.read_bytes()
+        result = subprocess.run([sys.executable, str(CLI), "--state", str(self.state),
+                                 "--now", str(self.now), "retry", "--id", "result-1"],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(self.state.read_bytes(), before)
+
+        result = subprocess.run([sys.executable, str(CLI), "--state", str(self.state),
+                                 "--now", str(self.now), "retry", "--id", "missing"],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(self.state.read_bytes(), before)
 
     def test_stale_unknown_and_quiet_events_do_not_cue_or_retrieve(self):
         self.put()
