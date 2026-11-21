@@ -1,5 +1,11 @@
 # K151 hardware acceptance
 
+## Proximity on both radios — firmware source `3b45976`
+
+On one K151, the same privately configured, motor-disabled build (ELF `b92780a3074bf95a9e56f08d12fd2626e964b261fd282bb04d86a5391ba93d72`) returned six fresh proximity readings on authenticated Wi-Fi and six on authenticated Bluetooth. Each group ran on one session of its specified transport. The previous firmware was restored and authenticated again after the trial.
+
+This trial did not exercise motion, camera capture, touch, a spoken survey or any of the three prompts. No on-device listening result was collected.
+
 ## Bluetooth camera with standard discovery responders
 
 A privately configured, motor-disabled candidate (ELF fingerprint `e7e56505`) authenticated over Bluetooth on one K151. Six fresh proximity queries succeeded on the same authenticated session, the last at 65.1 seconds. A single stationary camera request then delivered a complete 320 × 240 RGB565 frame (153,600 bytes) without a reconnect or retry. The image was not retained. The previous firmware and boot selectors were restored and verified, and the previous host pin authenticated the restored unit over Wi-Fi.

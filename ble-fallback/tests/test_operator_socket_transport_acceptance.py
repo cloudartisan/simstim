@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -20,23 +21,37 @@ import dual_transport_daemon
 from bluez_gatt import BoundedByteQueue, OrderedFragments, encode_fragment
 from tls_control_bridge import TLSControlBridge
 from test_public_entrypoints import SimulatedPSKPeer
+from test_motion_diagnostic import success_lines
 
 KEY = bytes(range(32))
 DIGEST = "c" * 64
 CUES = ("online", "no_update", "check_failed")
 
 
-def operator_request(path, command, timeout=10):
+def operator_request(path, command, timeout=10, expected_identity=None):
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(timeout)
     sock.connect(str(path))
-    sock.sendall((json.dumps({"command": command}) + "\n").encode())
+    payload = {"command": command}
+    if expected_identity is not None: payload["expected_identity"] = expected_identity
+    sock.sendall((json.dumps(payload) + "\n").encode())
     with sock.makefile("rb") as reader:
         raw = reader.readline(4097)
     sock.close()
     if not raw.endswith(b"\n") or len(raw) > 4096:
         raise AssertionError("operator socket returned no bounded JSON line")
     return json.loads(raw)
+
+
+def operator_cli(path, command, identity):
+    args = [sys.executable, str(WIRELESS / "cli.py"), "--socket", str(path)]
+    args += [command] if command == "motion-diagnostic" else ["verify-cue", command]
+    args += ["--expected-peer", identity["peer_identity"],
+             "--expected-elf", identity["device_elf_sha256"],
+             "--expected-transport", identity["transport"],
+             "--expected-generation", str(identity["generation"])]
+    return subprocess.run(args, capture_output=True, text=True, timeout=15,
+                          env={**os.environ, "PYTHONPATH": str(WIRELESS)})
 
 
 class OperatorSocketTransportAcceptance(unittest.TestCase):
@@ -130,42 +145,78 @@ class OperatorSocketTransportAcceptance(unittest.TestCase):
                 time.sleep(.005)
             self.assertTrue(control.connected, f"{bearer} authenticated Control.session did not start")
             result_box, errors = [], []
+            identity = control._identity()
+            missing = operator_request(listener_path, f"verify-cue {cue}" if cue != "motion-diagnostic" else cue)
+            self.assertFalse(missing["ok"], missing)
+            self.assertIn("caller identity pin required", missing["error"])
+            malformed = operator_request(listener_path, f"verify-cue {cue}" if cue != "motion-diagnostic" else cue,
+                                         expected_identity={**identity, "generation": True})
+            self.assertFalse(malformed["ok"], malformed)
+            self.assertIn("invalid caller identity pin", malformed["error"])
+            for wrong in (dict(identity, transport="ble" if bearer == "wifi" else "wifi"),
+                          dict(identity, generation=identity["generation"] + 1)):
+                rejected = operator_cli(listener_path, cue, wrong)
+                self.assertEqual(rejected.returncode, 1, rejected.stderr)
+                self.assertIn("session does not match caller pin", rejected.stdout)
+            device.settimeout(.2)
+            with self.assertRaises(RuntimeError):
+                peer.read_line()
+            device.settimeout(None)
             def invoke():
-                try: result_box.append(operator_request(listener_path, f"verify-cue {cue}"))
+                try: result_box.append(operator_cli(listener_path, cue, identity))
                 except Exception as exc: errors.append(exc)
             caller = threading.Thread(target=invoke, daemon=True)
             caller.start()
             request = peer.read_line().decode("ascii").strip()
             fields = request.split()
-            self.assertEqual(fields[:2], ["VERIFY_CUE", cue], request)
-            self.assertRegex(fields[2], r"^[0-9a-f]{16}$")
-            nonce = fields[2]
-            if cue == "online":
-                peer.write((f"SIMSTIM_SPEAKER cue=online result=played stereo_bytes=2048 status=0000 reset_off=1 verify={nonce}\n"
-                            f"VERIFY_DONE {nonce} cue=online outcome=played\n").encode())
+            if cue == "motion-diagnostic":
+                self.assertEqual(fields[0], "LOOK_MOTION", request)
+                nonce = fields[1]
+                self.assertRegex(nonce, r"^[0-9a-f]{16}$")
+                peer.write(("\n".join(success_lines(nonce)) + "\n").encode())
             else:
-                tap_id = "1a2b3c4d"
-                peer.write(f"TAP_FETCH {tap_id} VERIFY {nonce}\n".encode())
-                provider = peer.read_line().decode("ascii").strip()
-                expected_provider = "TAP_NONE" if cue == "no_update" else "TAP_FAIL"
-                self.assertEqual(provider, f"{expected_provider} {tap_id}")
-                terminal = "none" if cue == "no_update" else "failed"
-                peer.write((f"SIMSTIM_SPEAKER cue={cue} result=played stereo_bytes=2048 status=0000 reset_off=1 verify={nonce} tap_id={tap_id}\n"
-                            f"TAP_DONE {tap_id} {terminal}\n"
-                            f"VERIFY_DONE {nonce} tap_id={tap_id} outcome={terminal}\n").encode())
+                self.assertEqual(fields[:2], ["VERIFY_CUE", cue], request)
+                self.assertRegex(fields[2], r"^[0-9a-f]{16}$")
+                nonce = fields[2]
+                if cue == "online":
+                    peer.write((f"SIMSTIM_SPEAKER cue=online result=played stereo_bytes=2048 status=0000 reset_off=1 verify={nonce}\n"
+                                f"VERIFY_DONE {nonce} cue=online outcome=played\n").encode())
+                else:
+                    tap_id = "1a2b3c4d"
+                    peer.write(f"TAP_FETCH {tap_id} VERIFY {nonce}\n".encode())
+                    provider = peer.read_line().decode("ascii").strip()
+                    expected_provider = "TAP_NONE" if cue == "no_update" else "TAP_FAIL"
+                    self.assertEqual(provider, f"{expected_provider} {tap_id}")
+                    terminal = "none" if cue == "no_update" else "failed"
+                    peer.write((f"SIMSTIM_SPEAKER cue={cue} result=played stereo_bytes=2048 status=0000 reset_off=1 verify={nonce} tap_id={tap_id}\n"
+                                f"TAP_DONE {tap_id} {terminal}\n"
+                                f"VERIFY_DONE {nonce} tap_id={tap_id} outcome={terminal}\n").encode())
             caller.join(5)
             self.assertFalse(caller.is_alive(), "operator socket request exceeded bound")
             self.assertFalse(errors, repr(errors))
             self.assertEqual(len(result_box), 1)
-            response = result_box[0]
+            cli_result = result_box[0]
+            self.assertEqual(cli_result.returncode, 0, cli_result.stderr)
+            response = json.loads(cli_result.stdout)
             self.assertTrue(response["ok"], response)
             result = response["result"]
-            self.assertEqual(result["cue"], cue)
-            self.assertEqual(result["transport"], bearer)
-            self.assertEqual(result["device_elf_sha256"], DIGEST)
-            self.assertIn("SIMSTIM_SPEAKER", result["playback_receipt"])
-            self.assertIn("VERIFY_DONE", result["transaction_receipt"])
-            if cue != "online": self.assertIn("TAP_DONE", result["tap_receipt"])
+            if cue == "motion-diagnostic":
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["transport"], bearer)
+                self.assertEqual(result["device_elf_sha256"], DIGEST)
+                self.assertEqual(result["events"][0]["requested"], None)
+                self.assertEqual(result["events"][0]["point"], "start")
+                device.settimeout(.2)
+                with self.assertRaises(RuntimeError):
+                    peer.read_line()
+                device.settimeout(None)
+            else:
+                self.assertEqual(result["cue"], cue)
+                self.assertEqual(result["transport"], bearer)
+                self.assertEqual(result["device_elf_sha256"], DIGEST)
+                self.assertIn("SIMSTIM_SPEAKER", result["playback_receipt"])
+                self.assertIn("VERIFY_DONE", result["transaction_receipt"])
+                if cue != "online": self.assertIn("TAP_DONE", result["tap_receipt"])
             stop.set()
             try: peer.close()
             except Exception: pass
@@ -198,6 +249,11 @@ class OperatorSocketTransportAcceptance(unittest.TestCase):
                 with self.subTest(bearer=bearer, cue=cue):
                     self.exercise(bearer, cue)
 
+    def test_motion_diagnostic_one_shot_via_operator_socket_over_wifi_and_ble(self):
+        for bearer in ("wifi", "ble"):
+            with self.subTest(bearer=bearer):
+                self.exercise(bearer, "motion-diagnostic")
+
     def test_replaced_session_after_enqueue_is_rejected_without_device_send(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as temp:
             root = Path(temp)
@@ -227,7 +283,7 @@ class OperatorSocketTransportAcceptance(unittest.TestCase):
                 item = original_get(*args, **kwargs)
                 entered.set()
                 if not release.wait(2): raise TimeoutError("dispatch gate timeout")
-                control.current = object()  # newer/replaced session
+                control.generation += 1  # newer authenticated session generation
                 return item
             control.pending.get = gated_get
             path = root / "operator.sock"
@@ -235,15 +291,18 @@ class OperatorSocketTransportAcceptance(unittest.TestCase):
             until = time.monotonic() + 2
             while not path.exists() and time.monotonic() < until: time.sleep(.005)
             output = []
-            caller = threading.Thread(target=lambda: output.append(operator_request(path, "verify-cue online")), daemon=True)
+            guard = control._identity()
+            caller = threading.Thread(target=lambda: output.append(operator_cli(path, "online", guard)), daemon=True)
             caller.start()
             self.assertTrue(entered.wait(2), "request was not enqueued")
             release.set()
             caller.join(3)
             self.assertFalse(caller.is_alive())
             self.assertEqual(len(output), 1)
-            self.assertFalse(output[0]["ok"], output[0])
-            self.assertIn("device command expired", output[0]["error"])
+            self.assertEqual(output[0].returncode, 1, output[0].stderr)
+            rejected = json.loads(output[0].stdout)
+            self.assertFalse(rejected["ok"], rejected)
+            self.assertIn("authenticated session does not match caller pin", rejected["error"])
             peer_sock.settimeout(.3)
             with self.assertRaises((socket.timeout, RuntimeError)):
                 peer.read_line()

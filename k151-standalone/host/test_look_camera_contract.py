@@ -47,10 +47,10 @@ class CameraFailureReceiptContract(unittest.TestCase):
 
     def test_motor_choreography_invokes_captures_only_at_settled_points(self):
         motor = (SOURCE.parent / "look_motor.c").read_text()
-        survey = motor[motor.index("bool motor_survey("):]
+        survey = motor[motor.index("bool motor_survey_impl("):]
         initial = survey.index("glance(0, context)")
         loop = survey.index("for (unsigned i = 0; i < MOTOR_VIEWS; ++i)", initial)
-        move = survey.index("!move_pose(&goal, &actual)", loop)
+        move = survey.index("!move_pose(&requested, &actual)", loop)
         completed = survey.index("completed++", move)
         next_glance = survey.index("glance(completed, context)", completed)
         self.assertLess(initial, loop)

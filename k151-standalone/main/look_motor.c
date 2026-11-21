@@ -73,6 +73,7 @@ static bool s_uart_ready;
 static bool s_busy;
 static const char *s_stage = "preflight";
 static TickType_t s_yaw_sample_tick, s_pitch_sample_tick;
+static uint32_t s_survey_run_id;
 
 static bool calibration_valid(void)
 {
@@ -457,11 +458,13 @@ static void telemetry(const char *action, const char *result,
 }
 
 static bool finish_session(bool ok, const char *action, motor_pose_t *actual,
-                           const char *reason)
+                           const char *reason, bool *released_out, bool *rail_off_out)
 {
     /* `actual` is the last completed, verified ReadPos sample; never read after rail-off. */
     bool released = torque_release();
     bool rail_off = rail_set(false);
+    if (released_out) *released_out = released;
+    if (rail_off_out) *rail_off_out = rail_off;
     s_busy = false;
     bool result = ok && released && rail_off && actual &&
                   actual->yaw_raw >= 0 && actual->pitch_raw >= 0;
@@ -470,6 +473,32 @@ static bool finish_session(bool ok, const char *action, motor_pose_t *actual,
               !rail_off ? "rail_off_unconfirmed" :
               !actual ? "final_readback_unavailable" : reason);
     return result;
+}
+
+static bool survey_finish(uint32_t run, bool ok, motor_pose_t *actual,
+                          const char *reason, const char *returned)
+{
+    bool released=false, off=false, idle=false;
+    if (run && ok) {
+        uint8_t yaw=0xff, pitch=0xff;
+        idle=servo_read(MOTOR_YAW_ID,MOTOR_REG_MOVING,1,&yaw) &&
+             servo_read(MOTOR_PITCH_ID,MOTOR_REG_MOVING,1,&pitch) && yaw==0 && pitch==0;
+        if (!idle) { ok=false; reason="idle_unverified"; }
+    }
+    bool result=finish_session(ok,"survey",actual,reason,&released,&off);
+    if (run) wire_printf("LOOK_MOTOR result=event action=survey run_id=%lu point=cleanup state=%s return=%s idle=%s torque_release=%s rail_off=%s\n",
+        (unsigned long)run, released && off ? "verified" : "failed",returned,
+        idle ? "verified_before_release" : "unverified",released ? "verified" : "failed",off ? "verified" : "failed");
+    return result;
+}
+
+static void survey_position_event(uint32_t run, const char *point, const char *state,
+                                  const motor_pose_t *target, const motor_pose_t *actual)
+{
+    if (!run) return;
+    wire_printf("LOOK_MOTOR result=event action=survey run_id=%lu point=%s state=%s requested_yaw_raw=%d requested_pitch_raw=%d measured_yaw_raw=%d measured_pitch_raw=%d\n",
+        (unsigned long)run,point,state,target ? target->yaw_raw : -1,target ? target->pitch_raw : -1,
+        actual ? actual->yaw_raw : -1,actual ? actual->pitch_raw : -1);
 }
 
 static bool begin_session(i2c_master_bus_handle_t bus, const char *action,
@@ -719,8 +748,8 @@ bool motor_look(i2c_master_bus_handle_t bus, const char *direction)
     if (!scan_home_valid) { scan_home = start; scan_home_valid = true; }
     if (is_home) {
         actual=start; s_stage="home_entry";
-        if(!survey_entry(&start,&actual) || !centre_goal(&goal)) return finish_session(false,direction,&actual,"home_entry_failed");
-        if(at_goal(&actual,&goal)){scan_home_valid=false;return finish_session(true,direction,&actual,"already_centred");}
+        if(!survey_entry(&start,&actual) || !centre_goal(&goal)) return finish_session(false,direction,&actual,"home_entry_failed",NULL,NULL);
+        if(at_goal(&actual,&goal)){scan_home_valid=false;return finish_session(true,direction,&actual,"already_centred",NULL,NULL);}
         s_stage="home_centre";
     }
     else {
@@ -732,10 +761,10 @@ bool motor_look(i2c_master_bus_handle_t bus, const char *direction)
         int max_pitch = scan_home.pitch_deg + MOTOR_TILT_HALF_SPAN_DEG;
         if (yaw < min_yaw || yaw > max_yaw || pitch < min_pitch || pitch > max_pitch ||
             !pose_at(yaw, pitch, &goal))
-            return finish_session(false, direction, &actual, "relative_envelope_refused");
+            return finish_session(false, direction, &actual, "relative_envelope_refused",NULL,NULL);
     }
     bool ok = move_pose(&goal, &actual);
-    bool result = finish_session(ok, direction, &actual, ok ? "complete" : "move_or_readback_failed");
+    bool result = finish_session(ok, direction, &actual, ok ? "complete" : "move_or_readback_failed",NULL,NULL);
     if (is_home && result) scan_home_valid = false;
     return result;
 }
@@ -744,20 +773,29 @@ bool motor_look(i2c_master_bus_handle_t bus, const char *direction)
  * Device-owned short survey. Callback runs only at settled views and is
  * strictly notification-only: it must return promptly and perform no waits.
  */
-bool motor_survey(i2c_master_bus_handle_t bus,
-                  void (*glance)(unsigned, void *), void *context)
+static bool motor_survey_impl(i2c_master_bus_handle_t bus,
+                  void (*glance)(unsigned, void *), void *context, bool diagnostic)
 {
     static const char *const action = "survey";
     motor_pose_t start, goal, actual = {-1, -1, -999, -999};
+    uint32_t run_id = 0;
+    if (diagnostic) { if (++s_survey_run_id == 0) ++s_survey_run_id; run_id=s_survey_run_id; }
+    bool return_attempted = false;
+    bool return_reached = false;
     s_stage = "survey_begin";
     if (!begin_session(bus, action, &start)) return false;
     actual = start;
+    survey_position_event(run_id, "start", "observed", NULL, &actual);
     s_stage = "survey_entry";
     if (!survey_entry(&start, &actual))
-        return finish_session(false, action, &actual, "survey_entry_failed");
-    if (!centre_goal(&start)) return finish_session(false,action,&actual,"invalid_home");
+        return survey_finish(run_id, false, &actual, "survey_entry_failed", "not_attempted");
+    if (!centre_goal(&start)) return survey_finish(run_id, false, &actual, "invalid_home", "not_attempted");
     s_stage="survey_centre";
-    if (!at_goal(&actual,&start) && !move_pose(&start,&actual)) return finish_session(false,action,&actual,"centre_not_reached");
+    if (!at_goal(&actual,&start) && !move_pose(&start,&actual)) {
+        survey_position_event(run_id, "centre", "failed", &start, &actual);
+        return survey_finish(run_id, false, &actual, "centre_not_reached", "not_attempted");
+    }
+    survey_position_event(run_id, "centre", "settled", &start, &actual);
     uint32_t elapsed_start = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
     const int pan = MOTOR_PAN_HALF_SPAN_DEG;
     const int tilt = MOTOR_TILT_HALF_SPAN_DEG;
@@ -774,17 +812,24 @@ bool motor_survey(i2c_master_bus_handle_t bus,
         if (views[i][0] < start.yaw_deg - pan || views[i][0] > start.yaw_deg + pan ||
             views[i][1] < start.pitch_deg - tilt || views[i][1] > start.pitch_deg + tilt ||
             !pose_at(views[i][0], views[i][1], &goal)) {
-            return finish_session(false, action, &actual, "unsupported_survey_pose");
+            return survey_finish(run_id, false, &actual, "unsupported_survey_pose", "not_attempted");
         }
     }
     if (glance) glance(0, context);
     for (unsigned i = 0; i < MOTOR_VIEWS; ++i) {
         s_stage = i == 0 ? "survey_waypoint_1" : "survey_waypoint_2";
-        if (!pose_at(views[i][0], views[i][1], &goal) || !move_pose(&goal, &actual)) {
+        motor_pose_t requested;
+        bool requested_valid = pose_at(views[i][0], views[i][1], &requested);
+        if (!requested_valid || !move_pose(&requested, &actual)) {
             ok = false;
+            char point[8];
+            (void)snprintf(point, sizeof(point), "view%u", i + 1);
+            survey_position_event(run_id, point, "failed",
+                                  requested_valid ? &requested : NULL, &actual);
             break;
         }
         completed++;
+        survey_position_event(run_id, i == 0 ? "view1" : "view2", "settled", &requested, &actual);
         if (actual.yaw_deg < min_yaw) min_yaw = actual.yaw_deg;
         if (actual.yaw_deg > max_yaw) max_yaw = actual.yaw_deg;
         if (actual.pitch_deg < min_pitch) min_pitch = actual.pitch_deg;
@@ -794,14 +839,32 @@ bool motor_survey(i2c_master_bus_handle_t bus,
     /* Attempt source-proven return only when the last readback remained safe. */
     if (ok && completed == MOTOR_VIEWS) {
         s_stage = "survey_return";
-        if (!move_pose(&start, &actual)) ok = false;
+        return_attempted = true;
+        return_reached = move_pose(&start, &actual);
+        if (!return_reached) {
+            ok = false;
+            survey_position_event(run_id, "return", "failed", &start, &actual);
+        } else {
+            survey_position_event(run_id, "return", "settled", &start, &actual);
+        }
     }
     uint32_t elapsed = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS) - elapsed_start;
-    bool result = finish_session(ok && completed == MOTOR_VIEWS, action, &actual,
-                                  ok ? "complete" : "survey_stopped_on_first_error");
+    bool result = survey_finish(run_id, ok && completed == MOTOR_VIEWS, &actual,
+                                ok ? "complete" : "survey_stopped_on_first_error",
+                                return_reached ? "verified" : return_attempted ? "failed" : "not_attempted");
     wire_printf("LOOK_MOTOR result=%s action=survey views=%u yaw_span_deg=%d pitch_span_deg=%d elapsed_ms=%lu profile_ms=%u\n",
            result ? "ok" : "failed", completed, max_yaw - min_yaw,
            max_pitch - min_pitch, (unsigned long)elapsed, MOTOR_PROFILE_MS);
     fflush(stdout);
     return result;
+}
+
+bool motor_survey(i2c_master_bus_handle_t bus, void (*glance)(unsigned,void *), void *context)
+{
+    return motor_survey_impl(bus,glance,context,false);
+}
+
+bool motor_motion_diagnostic(i2c_master_bus_handle_t bus)
+{
+    return motor_survey_impl(bus,NULL,NULL,true);
 }

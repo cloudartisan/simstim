@@ -78,7 +78,7 @@ class SharedControl(service.Control):
         self.wifi_accept_enabled = True
         self.wifi_accept_event.set()
 
-    def _submit(self, command, timeout=None):
+    def _submit(self, command, timeout=None, expected_identity=None):
         if command == "wifi-suspend" or command.startswith("wifi-suspend "):
             fields = command.split()
             if len(fields) > 2:
@@ -115,8 +115,11 @@ class SharedControl(service.Control):
                     "wifi_accept": "enabled" if self.wifi_accept_enabled else "suspended",
                     "diagnostics": diagnostics}
         if timeout is None:
-            timeout = service.OPERATION_TIMEOUTS.get(command, 35) if self._owner == "ble" else 35
-        return super()._submit(command, timeout)
+            timeout = (service.OPERATION_TIMEOUTS.get(command, 35)
+                       if self._owner == "ble" or command == "motion-diagnostic" else 35)
+        if expected_identity is None:
+            return super()._submit(command, timeout)
+        return super()._submit(command, timeout, expected_identity)
 
 
 def make_wifi_listener():

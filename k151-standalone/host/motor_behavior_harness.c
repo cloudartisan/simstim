@@ -361,12 +361,16 @@ int main(int argc, char **argv) {
         assert(regs[1][40] == 0 && regs[2][40] == 0 && !(expander[5] & 1));
         return 0;
     }
-    if (strcmp(argv[1], "survey") == 0) {
+    if (strcmp(argv[1], "survey") == 0 || strcmp(argv[1], "survey_diagnostic") == 0) {
         int pitch = test_raw_at_deg(SIMSTIM_MOTOR_PITCH_ZERO_RAW, 30, SIMSTIM_MOTOR_PITCH_DIRECTION);
         regs[2][56] = (uint8_t)(pitch >> 8); regs[2][57] = (uint8_t)pitch;
-        int ok = motor_survey((void *)0x1, NULL, NULL);
+        int ok = !strcmp(argv[1], "survey_diagnostic") ? motor_motion_diagnostic((void *)1) : motor_survey((void *)1, NULL, NULL);
         assert(ok); assert((expander[0x05] & 1) == 0);
         assert(goal_history_count[0] >= 4 && goal_history_count[1] >= 4);
+        if (strcmp(argv[1], "survey_diagnostic") == 0) {
+            assert(goal_history_count[0] == 4 && goal_history_count[1] == 4);
+            assert(goal_writes == 8 && other_servo_writes == 0);
+        }
         for (int axis = 0; axis < 2; ++axis) {
             for (int i = 0; i < goal_history_count[axis]; ++i) {
                 int raw = goal_history[axis][i];
@@ -405,7 +409,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[1], "survey_stalled") == 0) stall_next_goal = 1;
         if (strcmp(argv[1], "survey_link_loss") == 0) drop_after_next_motion_goal = 1;
         if (strcmp(argv[1], "survey_unsafe_readback") == 0) unsafe_after_next_motion_goal = 1;
-        int ok = motor_survey((void *)0x1, NULL, NULL);
+        int ok = motor_motion_diagnostic((void *)1);
         if (strcmp(argv[1], "survey_delayed") == 0) {
             assert(ok && goal_history_count[1] >= 2);
         } else {

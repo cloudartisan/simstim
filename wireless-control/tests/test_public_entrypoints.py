@@ -199,7 +199,8 @@ class PublicEntryPointTests(unittest.TestCase):
                     until=time.monotonic()+2
                     while not control.connected and time.monotonic()<until:time.sleep(.005)
                     outcome=[]
-                    op=threading.Thread(target=lambda:outcome.append(control._submit(f"verify-cue {cue}",timeout=8)))
+                    expected_identity=control._identity()
+                    op=threading.Thread(target=lambda:outcome.append(control._submit(f"verify-cue {cue}",timeout=8,expected_identity=expected_identity)))
                     op.start()
                     request=peer.read_line().decode().strip();self.assertRegex(request,rf"VERIFY_CUE {cue} [0-9a-f]{{16}}")
                     nonce=request.split()[-1]
@@ -245,8 +246,9 @@ class PublicEntryPointTests(unittest.TestCase):
                     until=time.monotonic()+2
                     while not control.connected and time.monotonic()<until:time.sleep(.005)
                     outcome=[]
+                    expected_identity=control._identity()
                     def submit():
-                        try:outcome.append(control._submit(f"verify-cue {cue}",timeout=1.5 if defect=="completion" else 6))
+                        try:outcome.append(control._submit(f"verify-cue {cue}",timeout=1.5 if defect=="completion" else 6,expected_identity=expected_identity))
                         except Exception as exc:outcome.append(exc)
                     op=threading.Thread(target=submit);op.start()
                     command=peer.read_line().decode().strip();nonce=command.split()[-1]

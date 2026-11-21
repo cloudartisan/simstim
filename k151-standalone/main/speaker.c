@@ -54,6 +54,7 @@ extern void board_look_end(void);
 extern bool camera_survey_begin(i2c_master_bus_handle_t bus),camera_survey_finish(void);
 extern void camera_survey_glance(unsigned index,void *ctx);
 extern bool motor_survey(i2c_master_bus_handle_t bus,void (*glance)(unsigned,void*),void*);
+extern bool motor_motion_diagnostic(i2c_master_bus_handle_t bus);
 static uint8_t *update_pcm; static size_t update_bytes; static uint32_t update_crc; static TickType_t update_time; static wire_owner_t update_owner; static uint32_t update_session;
 static void clear_update(void){free(update_pcm);update_pcm=NULL;update_bytes=0;update_crc=0;}
 static void expire_update(void){if(update_pcm && xTaskGetTickCount()-update_time>=pdMS_TO_TICKS(1800000))clear_update();}
@@ -96,11 +97,20 @@ static void dispatch_look(i2c_master_bus_handle_t bus,const char *cmd){
  /* Reject motor work before cue playback, camera setup, or motor power. Keep
     LOOK_FRAME camera-only; calibration gates every command that can move or
     probe the actuator, including survey's camera callbacks. */
- bool motor_command=!strcmp(cmd,"LOOK_SURVEY") || !strcmp(cmd,"LOOK_PROBE") ||
+ bool motion_diag=!strncmp(cmd,"LOOK_MOTION ",12);
+ if(motion_diag && !verification_token_valid(cmd+12)){wire_printf("LOOK_ERROR invalid_motion_token\n");return;}
+ bool motor_command=motion_diag || !strcmp(cmd,"LOOK_SURVEY") || !strcmp(cmd,"LOOK_PROBE") ||
     !strcmp(cmd,"LOOK_LEFT") || !strcmp(cmd,"LOOK_RIGHT") ||
     !strcmp(cmd,"LOOK_UP") || !strcmp(cmd,"LOOK_DOWN") || !strcmp(cmd,"LOOK_HOME");
  if(motor_command && !motor_calibration_ready()){
     wire_printf("LOOK_ERROR device_calibration_missing_or_invalid\n");fflush(stdout);return;
+ }
+ if(motion_diag){
+    can_speak=false;
+    wire_printf("MOTION_BEGIN %s\n",cmd+12);
+    bool ok=false;
+    if(board_look_cue(false)){ok=motor_motion_diagnostic(bus);board_look_end();}
+    wire_printf("MOTION_END %s ok=%u\n",cmd+12,(unsigned)ok);fflush(stdout);return;
  }
  bool staging=!strcmp(cmd,"STAGE_UPDATE");
  if(!strcmp(cmd,"TAP_CHECK")){tap_refresh();return;}

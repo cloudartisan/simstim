@@ -51,6 +51,7 @@ void vTaskDelay(TickType_t ticks){if(ticks==pdMS_TO_TICKS(40) && ++delay_calls>=
 bool board_proximity_status(uint16_t *count,bool *saturated){*count=0;*saturated=false;return true;}
 void simstim_wifi_provision_usb(void){}
 bool board_look_cue(bool camera){(void)camera;return true;} bool look_camera_capture(i2c_master_bus_handle_t b){(void)b;return true;} bool motor_look(i2c_master_bus_handle_t b,const char*c){(void)b;(void)c;return true;} bool motor_calibration_ready(void){return true;} void board_look_end(void){}
+bool motor_motion_diagnostic(i2c_master_bus_handle_t b){(void)b;return true;}
 bool camera_survey_begin(i2c_master_bus_handle_t b){(void)b;return true;} bool camera_survey_finish(void){return true;} void camera_survey_glance(unsigned i,void*c){(void)i;(void)c;} bool motor_survey(i2c_master_bus_handle_t b,void(*g)(unsigned,void*),void*c){(void)b;(void)g;(void)c;return true;}
 
 int main(int argc,char **argv){uint32_t len=sizeof(pcm_fixture),crc=argc>1?(uint32_t)strtoul(argv[1],NULL,16):crc32_std(pcm_fixture,sizeof(pcm_fixture));memcpy(staged_wire,&len,4);memcpy(staged_wire+4,&crc,4);memcpy(staged_wire+8,pcm_fixture,sizeof(pcm_fixture));

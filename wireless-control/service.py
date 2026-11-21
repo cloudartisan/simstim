@@ -19,6 +19,7 @@ def release_elf_path() -> Path:
 sys.path.insert(0, str(ROOT / "tools"))
 import look_room
 import tap_refresh
+import motion_diagnostic
 
 BIND = os.environ.get("SIMSTIM_BIND", "127.0.0.1")
 PORT = int(os.environ.get("SIMSTIM_PORT", "18767"))
@@ -39,7 +40,8 @@ OPERATOR_MARGIN_S = 15
 WIFI_SUSPEND_S = 900
 OPERATION_TIMEOUTS = {"frame": FRAME_DEADLINE_S + OPERATOR_MARGIN_S,
                       "survey": SURVEY_DEADLINE_S + OPERATOR_MARGIN_S,
-                      "observe": OBSERVE_DEADLINE_S + OPERATOR_MARGIN_S}
+                      "observe": OBSERVE_DEADLINE_S + OPERATOR_MARGIN_S,
+                      "motion-diagnostic": 180}
 COMMANDS = {"status": "STATUS", "touch": "TOUCH_STATUS", "prox": "PROX_STATUS", "probe": "LOOK_PROBE", "home": "LOOK_HOME", "left": "LOOK_LEFT", "right": "LOOK_RIGHT", "up": "LOOK_UP", "down": "LOOK_DOWN", "frame": "LOOK_FRAME", "survey": "LOOK_SURVEY", "ble-diagnostics": "BLE_DIAGNOSTICS"}
 BLE_DIAG_LEGACY = re.compile(r"SIMSTIM_BLE_DIAG generation=(\d{1,10}) cause=(gap|tls|return|fragment|tx|rx|write|unknown) gap=(-?\d{1,11}) rc=(-?\d{1,11}) tx=(\d{1,10}) rx=(\d{1,10}) fragment_reject=(\d{1,10})")
 BLE_DIAG_EXTENDED = re.compile(r"SIMSTIM_BLE_DIAG generation=(\d{1,10}) cause=(gap|tls|return|fragment|tx|rx|write|unknown) gap=(-?\d{1,11}) rc=(-?\d{1,11}) tx=(\d{1,10}) rx=(\d{1,10}) fragment_reject=(\d{1,10}) write_acks=(\d{1,10}) write_seq=(\d{1,5}) write_rc=(-?\d{1,11})")
@@ -139,19 +141,49 @@ class Control:
             event={"count":self.last_event["count"],"uptime_ms":self.last_event["uptime_ms"],
                    "age_ms":max(0,round((now-self.last_event["received_monotonic"])*1000)),
                    "fresh":now-self.last_event["received_monotonic"]<=30}
-        return {"ok":self.connected,"transport":"TLS1.2-PSK-AES128-GCM-SHA256" if self.connected else "disconnected","peer_identity":self.peer,"device_elf_sha256":self.device_id,"uptime_s":self.uptime,"touch":sample(self.last_touch),"proximity":sample(self.last_prox),"tap_event":event,"last_ble_diagnostic":self.last_ble_diagnostic}
-    def _submit(self,command,timeout=None):
-        if command=="status": return self.status()
-        if timeout is None: timeout=35
-        if not self.connected: raise WirelessError("no verified device")
-        item={"session":self.current,"deadline":time.monotonic()+timeout,"command":command,"done":threading.Event(),"result":None}
-        if command.startswith("verify-cue "):
-            item["cue_session"]=(item["session"],self.peer,self.device_id,getattr(self,"_owner",None) or "wifi",getattr(self,"generation",self._session_generation))
-        self.pending.put(item,timeout=1)
+        return {"ok":self.connected,"transport":"TLS1.2-PSK-AES128-GCM-SHA256" if self.connected else "disconnected","bearer":(getattr(self,"_owner",None) or "wifi") if self.connected else "disconnected","generation":getattr(self,"generation",self._session_generation),"peer_identity":self.peer,"device_elf_sha256":self.device_id,"uptime_s":self.uptime,"touch":sample(self.last_touch),"proximity":sample(self.last_prox),"tap_event":event,"last_ble_diagnostic":self.last_ble_diagnostic}
+    def _identity(self):
+        return {"peer_identity": self.peer, "device_elf_sha256": self.device_id,
+                "transport": getattr(self, "_owner", None) or "wifi",
+                "generation": getattr(self, "generation", self._session_generation)}
+
+    def _submit(self, command, timeout=None, expected_identity=None):
+        return self._submit_pinned(command, timeout, expected_identity)
+
+    def _submit_pinned(self, command, timeout=None, expected_identity=None):
+        if command == "status":
+            return self.status()
+        guarded = command == "motion-diagnostic" or command.startswith("verify-cue ")
+        if guarded:
+            if not isinstance(expected_identity, dict) or set(expected_identity) != {
+                    "peer_identity", "device_elf_sha256", "transport", "generation"}:
+                raise WirelessError("caller identity pin required")
+            if (not isinstance(expected_identity["peer_identity"], str) or
+                    not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", expected_identity["peer_identity"]) or
+                    not isinstance(expected_identity["device_elf_sha256"], str) or
+                    not re.fullmatch(r"[0-9a-f]{64}", expected_identity["device_elf_sha256"]) or
+                    expected_identity["transport"] not in {"wifi", "ble"} or
+                    type(expected_identity["generation"]) is not int or
+                    not 0 <= expected_identity["generation"] <= 0xffffffff):
+                raise WirelessError("invalid caller identity pin")
+        if timeout is None:
+            timeout = OPERATION_TIMEOUTS.get(command, 35)
+        # Serialize the enqueue snapshot with the session worker's pre-write check.
+        with self.lock:
+            if not self.connected or self.current is None:
+                raise WirelessError("no verified device")
+            if guarded and self._identity() != expected_identity:
+                raise WirelessError("authenticated session does not match caller pin")
+            item = {"session": self.current, "deadline": time.monotonic()+timeout,
+                    "command": command, "done": threading.Event(), "result": None}
+            if guarded:
+                item["expected_identity"] = dict(expected_identity)
+        self.pending.put(item, timeout=1)
         if not item["done"].wait(timeout):
-            item["cancelled"]=True
+            item["cancelled"] = True
             raise WirelessError("device command timed out; request was not replayed")
-        if isinstance(item["result"],Exception): raise item["result"]
+        if isinstance(item["result"], Exception):
+            raise item["result"]
         return item["result"]
     def _readline(self,stream,timeout: float=20):
         deadline=getattr(self,"_active_deadline",None)
@@ -254,6 +286,9 @@ class Control:
             if active is not None and (active.get("cancelled") or self.current is not s or time.monotonic()>=active["deadline"]):
                 raise WirelessError("device command expired; no further actuation sent")
         ensure_active()
+        if command == "motion-diagnostic":
+            self._check_caller_pin(s, active)
+            return self._motion_diagnostic(s, active, ensure_active)
         if command=="ble-diagnostics":
             s.write(b"BLE_DIAGNOSTICS\n")
             line=self._expect(s,["SIMSTIM_BLE_DIAG ","LOOK_ERROR diagnostics_"])
@@ -374,28 +409,70 @@ class Control:
             return {"ok":True,"id":ident,"receipt":"prepared"}
         raise WirelessError("unsupported operator command")
 
+    def _check_caller_pin(self, s, item):
+        expected = item.get("expected_identity") if item is not None else None
+        if (not isinstance(expected, dict) or item.get("session") is not s or
+                not self.connected or self.current is not s or self._identity() != expected):
+            raise WirelessError("authenticated session does not match caller pin")
+        return expected
+
+    def _motion_diagnostic(self, s, item, ensure_active):
+        if item is None:
+            raise WirelessError("motion diagnostic requires an operator-bound session")
+        identity = self._check_caller_pin(s, item)
+        nonce=secrets.token_hex(8)
+        ensure_active()
+        self._check_caller_pin(s, item)
+        # One write only. A timeout, disconnect, or malformed result is never replayed.
+        s.write(f"LOOK_MOTION {nonce}\n".encode("ascii"))
+        lines=[]
+        while len(lines)<64:
+            ensure_active()
+            self._check_caller_pin(s, item)
+            try:
+                line=self._readline(s, min(10, max(.1, item["deadline"]-time.monotonic())))
+            except (TimeoutError, OSError) as exc:
+                raise WirelessError("motion diagnostic response lost; request was not replayed") from exc
+            if line is None:
+                continue
+            lines.append(line)
+            if line.startswith("MOTION_END "):
+                break
+        else:
+            raise WirelessError("motion diagnostic exceeded response bound")
+        ensure_active()
+        self._check_caller_pin(s, item)
+        try:
+            result=motion_diagnostic.parse_motion_diagnostic(lines, nonce)
+        except motion_diagnostic.MotionDiagnosticError as exc:
+            raise WirelessError(str(exc)) from exc
+        result.update(identity)
+        return result
+
     def _verify_cue(self,s,cue,ensure_active):
         # This runs on the authenticated session worker while its I/O lock is held.
+        caller_identity = self._check_caller_pin(s, getattr(self, "_active_item", None))
         pin=getattr(self,"expected",None)
         normalized_pin=pin.lower() if isinstance(pin,str) else ""
         digest=self.device_id if isinstance(self.device_id,str) else ""
-        if (not self.connected or self.current is not s or
-                not re.fullmatch(r"[0-9a-f]{64}",digest) or
+        if (not re.fullmatch(r"[0-9a-f]{64}",digest) or
                 not isinstance(pin,str) or not re.fullmatch(r"[0-9a-fA-F]{64}",pin) or
-                normalized_pin!=digest.lower()):
+                normalized_pin!=digest.lower() or caller_identity["device_elf_sha256"].lower()!=normalized_pin):
             raise WirelessError("cue verification requires an authenticated session with the matching ELF pin")
         nonce=secrets.token_hex(8)
-        transport=getattr(self,"_owner",None) or "wifi"
-        generation=getattr(self,"generation",self._session_generation)
+        transport=caller_identity["transport"]
+        generation=caller_identity["generation"]
         identity=(self.current,self.peer,self.device_id,transport,generation)
         def ensure_same_session():
-            current=(self.current,self.peer,self.device_id,getattr(self,"_owner",None) or "wifi",
-                     getattr(self,"generation",self._session_generation))
-            if not self.connected or self.current is not s or current!=identity:
+            current=self._identity()
+            if not self.connected or self.current is not s or current != {
+                    "peer_identity": identity[1], "device_elf_sha256": identity[2],
+                    "transport": identity[3], "generation": identity[4]}:
                 raise WirelessError("authenticated session changed during cue verification")
         provider={"cue":cue,"provider":"none" if cue=="no_update" else "error","fetch_id":None,"nonce":nonce}
         item=getattr(self,"_active_item",None)
-        if item is None or item.get("cue_session")!=identity:raise WirelessError("authenticated session changed since cue request was queued")
+        if item is None or item.get("expected_identity") != caller_identity:
+            raise WirelessError("authenticated session changed since cue request was queued")
         item["verification"]=provider
         try:
             ensure_active()
@@ -487,10 +564,18 @@ def run_operator(control,path=OPSOCK,*,stop=None):
                 try:
                     with client.makefile('rb') as reader: raw=reader.readline(4097)
                     if not raw.endswith(b"\n") or len(raw)>4096:raise WirelessError("one bounded newline-terminated request required")
-                    req=json.loads(raw); cmd=req.get("command")
+                    req=json.loads(raw)
+                    if not isinstance(req,dict):raise WirelessError("request must be a JSON object")
+                    cmd=req.get("command")
                     if not isinstance(cmd,str):raise WirelessError("command required")
-                    result=control._submit(cmd)
-                    response=json.dumps({"ok":True,"result":result},separators=(",",":"))
+                    guarded=cmd=="motion-diagnostic" or bool(re.fullmatch(r"verify-cue (online|no_update|check_failed)",cmd))
+                    if guarded and "expected_identity" not in req:
+                        raise WirelessError("caller identity pin required")
+                    if not guarded and "expected_identity" in req:
+                        raise WirelessError("expected_identity is only valid for pinned actions")
+                    result=control._submit(cmd,expected_identity=req.get("expected_identity"))
+                    ok=bool(result.get("ok")) if cmd=="motion-diagnostic" and isinstance(result,dict) else True
+                    response=json.dumps({"ok":ok,"result":result},separators=(",",":"))
                 except Exception as e:
                     response=json.dumps({"ok":False,"error":str(e)[:160]},separators=(",",":"))
                 # A caller that timed out must not kill the listener or replay work.

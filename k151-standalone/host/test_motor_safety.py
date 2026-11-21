@@ -11,6 +11,7 @@ FAKES = ROOT / "host" / "fakes"
 CONFIG_TEMPLATE = ROOT / "public_config.h.in"
 SCRATCH = Path.home() / ".hermes" / "cache" / "scratch" / "k151-motor-behavior"
 PREPARE_FEETECH = ROOT.parent / "scripts" / "prepare-feetech-source.py"
+from tools.look_room import parse_motor_receipt
 
 # Deliberately synthetic settings: 4 raw units/degree, zero at 500, and
 # generous limits around the harness's bounded center/survey trajectory.
@@ -278,6 +279,86 @@ class MotorBehaviorTests(unittest.TestCase):
     def test_survey_keeps_both_waypoints_and_returns_to_synthetic_home(self):
         result = self.run_scenario("survey")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_survey_diagnostic_records_settled_path_in_the_deployed_wire_parser(self):
+        result = self.run_scenario("survey_diagnostic")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        events = [line for line in result.stdout.splitlines()
+                  if line.startswith("LOOK_MOTOR result=event action=survey ")]
+        self.assertEqual(len(events), 6, result.stdout)
+        self.assertTrue(all(len(line) <= 240 and parse_motor_receipt(line) == line
+                            for line in events), events)
+        self.assertEqual([next(part[6:] for part in line.split() if part.startswith("point="))
+                          for line in events],
+                         ["start", "centre", "view1", "view2", "return", "cleanup"])
+        run_ids = {next(part[7:] for part in line.split() if part.startswith("run_id="))
+                   for line in events}
+        self.assertEqual(run_ids, {"1"})
+        self.assertIn("requested_yaw_raw=-1 requested_pitch_raw=-1", events[0])
+        self.assertNotIn("result=event", self.run_scenario("survey").stdout)
+        for line in events[:5]:
+            self.assertIn("requested_yaw_raw=", line)
+            self.assertIn("requested_pitch_raw=", line)
+            self.assertIn("measured_yaw_raw=", line)
+            self.assertIn("measured_pitch_raw=", line)
+        self.assertIn("return=verified idle=verified_before_release torque_release=verified rail_off=verified", events[-1])
+
+        parsed_receipts = [parse_motor_receipt(line) for line in events]
+        self.assertEqual(parsed_receipts, events)
+        self.assertTrue(all(receipt is not None for receipt in parsed_receipts))
+
+    def test_partial_move_diagnostic_reports_observation_without_replaying_or_fabricating_return(self):
+        result = self.run_scenario("survey_stalled")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        events = [line for line in result.stdout.splitlines()
+                  if line.startswith("LOOK_MOTOR result=event action=survey ")]
+        self.assertEqual(len(events), 4, result.stdout)
+        failed_view = next(line for line in events if "point=view1 " in line)
+        self.assertIn("state=failed", failed_view)
+        self.assertIn("requested_yaw_raw=380 requested_pitch_raw=652", failed_view)
+        self.assertIn("measured_yaw_raw=", failed_view)
+        self.assertIn("measured_pitch_raw=", failed_view)
+        self.assertIn("measured_pitch_raw=-1", failed_view)
+        self.assertLessEqual(len(failed_view), 240)
+        self.assertEqual(parse_motor_receipt(failed_view), failed_view)
+        self.assertNotIn("point=view2", result.stdout)
+        self.assertNotIn("point=return", result.stdout)
+        self.assertIn("point=cleanup state=verified return=not_attempted idle=unverified", events[-1])
+        self.assertIn("torque_release=verified rail_off=verified", events[-1])
+
+    def test_unavailable_failed_move_readback_is_explicitly_not_measured(self):
+        result = self.run_scenario("survey_link_loss")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        failed_view = next(line for line in result.stdout.splitlines()
+                           if "point=view1 " in line and "result=event" in line)
+        self.assertIn("state=failed", failed_view)
+        self.assertIn("measured_yaw_raw=-1 measured_pitch_raw=-1", failed_view)
+        self.assertLessEqual(len(failed_view), 240)
+        self.assertEqual(parse_motor_receipt(failed_view), failed_view)
+        self.assertNotIn("point=view2", result.stdout)
+        self.assertNotIn("point=return", result.stdout)
+
+    def test_host_parses_native_motor_records_and_preserves_partial_evidence(self):
+        import runpy
+        parser = runpy.run_path(str(ROOT.parent / "wireless-control/motion_diagnostic.py"))
+        parse = parser["parse_motion_diagnostic"]
+        nonce = "abcdef0123456789"
+        for scenario, success in (("survey_diagnostic", True), ("survey_stalled", False), ("survey_link_loss", False)):
+            with self.subTest(scenario=scenario):
+                run = self.run_scenario(scenario)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                # Envelopes are fixtures; all intervening records come from compiled firmware.
+                lines = [f"MOTION_BEGIN {nonce}", *run.stdout.splitlines(), f"MOTION_END {nonce} ok={int(success)}"]
+                result = parse(lines, nonce)
+                self.assertIs(result["ok"], success)
+                self.assertIsNone(result["events"][0]["requested"])
+                self.assertEqual(result["events"][-1]["idle"], "verified_before_release" if success else "unverified")
+                if not success:
+                    self.assertNotIn("return", [row["point"] for row in result["events"]])
+                    self.assertEqual(result["events"][-2]["measured"]["pitch_raw"], -1)
+                for malformed in (lines[1:], ["MOTION_BEGIN 0000000000000000", *lines[1:]], [*lines, lines[1]]):
+                    with self.assertRaises(parser["MotionDiagnosticError"]):
+                        parse(malformed, nonce)
 
     def test_unsupported_calibrated_pose_is_rejected_before_cue_or_motion(self):
         result = self.run_scenario("unsupported_pose")

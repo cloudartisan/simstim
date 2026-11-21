@@ -8,9 +8,11 @@ COMMAND_TIMEOUTS = {'frame': 330, 'survey': 630, 'observe': 850}
 TRANSIENT = frozenset(('no verified device', 'expired command', 'peer closed',
                        '[Errno 104] Connection reset by peer', '[Errno 32] Broken pipe'))
 
-def request_once(path, command, timeout):
+def request_once(path, command, timeout, expected_identity=None):
     with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as s:
-        s.settimeout(timeout); s.connect(str(path)); s.sendall((json.dumps({'command':command})+'\n').encode())
+        payload={'command':command}
+        if expected_identity is not None: payload['expected_identity']=expected_identity
+        s.settimeout(timeout); s.connect(str(path)); s.sendall((json.dumps(payload,separators=(',',':'))+'\n').encode())
         data=bytearray()
         while not data.endswith(b'\n'):
             chunk=s.recv(4096)
@@ -51,13 +53,25 @@ def main():
     sub=p.add_subparsers(dest="command",required=True)
     for name in ("status","touch","prox","probe","left","right","up","down","home","frame","survey","observe","speak","tap-check","tap-status","staged-status","ble-diagnostics"):
         sub.add_parser(name)
+    def add_identity_pin(parser):
+        parser.add_argument("--expected-peer",required=True)
+        parser.add_argument("--expected-elf",required=True)
+        parser.add_argument("--expected-transport",choices=("wifi","ble"),required=True)
+        parser.add_argument("--expected-generation",type=int,required=True)
+    motion=sub.add_parser("motion-diagnostic",help="one-shot motion diagnostic bound to an explicit session")
+    add_identity_pin(motion)
     verify=sub.add_parser("verify-cue",help="one-shot exact receipt and transaction verification")
     verify.add_argument("cue",choices=("online","no_update","check_failed"))
+    add_identity_pin(verify)
     pub=sub.add_parser("tap-publish");pub.add_argument("id");pub.add_argument("summary")
     stage=sub.add_parser("stage"); stage.add_argument("summary")
     a=p.parse_args(); command=("tap-publish "+a.id+" "+a.summary) if a.command=="tap-publish" else ("stage "+a.summary if a.command=="stage" else ("verify-cue "+a.cue if a.command=="verify-cue" else a.command))
+    expected_identity=None
+    if a.command in {"verify-cue","motion-diagnostic"}:
+        expected_identity={"peer_identity":a.expected_peer,"device_elf_sha256":a.expected_elf,
+                           "transport":a.expected_transport,"generation":a.expected_generation}
     try:
-        result=request(a.socket,command)
+        result=request_once(a.socket,command,195 if a.command=="motion-diagnostic" else 45,expected_identity) if expected_identity is not None else request(a.socket,command)
         print(json.dumps(result,ensure_ascii=False,indent=2))
         return 0 if result.get("ok") else 1
     except Exception as e:

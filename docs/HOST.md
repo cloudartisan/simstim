@@ -45,7 +45,12 @@ With the daemon running under the configured account, use the CLI directly:
 ```sh
 python wireless-control/cli.py --socket "$SIMSTIM_OPERATOR_SOCKET" status
 python wireless-control/cli.py --socket "$SIMSTIM_OPERATOR_SOCKET" tap-status
+python wireless-control/cli.py --socket "$SIMSTIM_OPERATOR_SOCKET" motion-diagnostic --expected-peer "$PEER" --expected-elf "$ELF" --expected-transport "$BEARER" --expected-generation "$GENERATION"
 ```
+
+Set `PEER`, `ELF`, `BEARER` and `GENERATION` from the authenticated status you intend to test. Confirm the peer and firmware against your deployment record, select the intended Wi-Fi (`wifi`) or Bluetooth (`ble`) session, and do not silently refresh the pin on reconnect.
+
+`motion-diagnostic` issues exactly one nonce-bound `LOOK_MOTION` request on the current authenticated device session. It is explicitly non-retrying: timeout, disconnect, malformed evidence, or a session change returns failure rather than replaying motion. Successful output contains only structured survey point targets, measured raw positions, cleanup verification, and authenticated session identity; it does not access cameras, microphones, or speech.
 
 A plain Python client can also use the versioned transport shape (one newline-terminated JSON request and one JSON response):
 
