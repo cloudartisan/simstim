@@ -51,9 +51,11 @@ def main():
     sub=p.add_subparsers(dest="command",required=True)
     for name in ("status","touch","prox","probe","left","right","up","down","home","frame","survey","observe","speak","tap-check","tap-status","staged-status","ble-diagnostics"):
         sub.add_parser(name)
+    verify=sub.add_parser("verify-cue",help="one-shot exact receipt and transaction verification")
+    verify.add_argument("cue",choices=("online","no_update","check_failed"))
     pub=sub.add_parser("tap-publish");pub.add_argument("id");pub.add_argument("summary")
     stage=sub.add_parser("stage"); stage.add_argument("summary")
-    a=p.parse_args(); command=("tap-publish "+a.id+" "+a.summary) if a.command=="tap-publish" else ("stage "+a.summary if a.command=="stage" else a.command)
+    a=p.parse_args(); command=("tap-publish "+a.id+" "+a.summary) if a.command=="tap-publish" else ("stage "+a.summary if a.command=="stage" else ("verify-cue "+a.cue if a.command=="verify-cue" else a.command))
     try:
         result=request(a.socket,command)
         print(json.dumps(result,ensure_ascii=False,indent=2))

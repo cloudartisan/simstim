@@ -6,7 +6,7 @@ persistence, raw sensor history, or ambient automation is implemented here.
 """
 from __future__ import annotations
 import ctypes as C
-import fcntl, hashlib, json, os, queue, re, select, socket, stat, struct, sys, threading, time, zlib
+import fcntl, hashlib, json, os, queue, re, secrets, select, socket, stat, struct, sys, threading, time, zlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -127,6 +127,7 @@ class Control:
         self.expected: str | None = None
         self.last_event=None; self.started=time.monotonic(); self.pending=queue.Queue(maxsize=8)
         self.last_ble_diagnostic=None; self.voice=None
+        self._session_generation=0
     def status(self):
         now=time.monotonic()
         def sample(value):
@@ -143,13 +144,16 @@ class Control:
         if command=="status": return self.status()
         if timeout is None: timeout=35
         if not self.connected: raise WirelessError("no verified device")
-        item={"session":self.current,"deadline":time.monotonic()+timeout,"command":command,"done":threading.Event(),"result":None}; self.pending.put(item,timeout=1)
+        item={"session":self.current,"deadline":time.monotonic()+timeout,"command":command,"done":threading.Event(),"result":None}
+        if command.startswith("verify-cue "):
+            item["cue_session"]=(item["session"],self.peer,self.device_id,getattr(self,"_owner",None) or "wifi",getattr(self,"generation",self._session_generation))
+        self.pending.put(item,timeout=1)
         if not item["done"].wait(timeout):
             item["cancelled"]=True
             raise WirelessError("device command timed out; request was not replayed")
         if isinstance(item["result"],Exception): raise item["result"]
         return item["result"]
-    def _readline(self,stream,timeout=20):
+    def _readline(self,stream,timeout: float=20):
         deadline=getattr(self,"_active_deadline",None)
         if deadline is not None:
             remaining=deadline-time.monotonic()
@@ -161,7 +165,21 @@ class Control:
         if ev:
             self.last_event={"count":int(ev.group(1)),"uptime_ms":int(ev.group(2)),"received_monotonic":time.monotonic()}; return None
         if line.startswith("TAP_FETCH "):
-            if not re.fullmatch(r"TAP_FETCH [0-9a-f]{8}",line): raise WirelessError("malformed TAP_FETCH")
+            diagnostic=re.fullmatch(r"TAP_FETCH ([0-9a-f]{8}) VERIFY ([0-9a-f]{16})",line)
+            ordinary=re.fullmatch(r"TAP_FETCH ([0-9a-f]{8})",line)
+            if diagnostic is None and ordinary is None: raise WirelessError("malformed TAP_FETCH")
+            active=getattr(self,"_active_item",None)
+            verification=active.get("verification") if active is not None else None
+            if diagnostic is not None:
+                request_id,nonce=diagnostic.groups()
+                if verification is None or nonce!=verification.get("nonce"):
+                    raise WirelessError("unmatched diagnostic TAP_FETCH")
+                if verification.get("fetch_id") is not None: raise WirelessError("duplicate diagnostic TAP_FETCH")
+                verification["fetch_id"]=request_id
+                response="TAP_NONE" if verification["provider"]=="none" else "TAP_FAIL"
+                stream.write(f"{response} {request_id}\n".encode("ascii"))
+                if hasattr(stream,"flush"):stream.flush()
+                return None
             engine=getattr(self,"voice",None)
             outcome=tap_refresh.serve_fetch(stream,line,self.state_path,engine)
             return "TAP_DONE "+outcome
@@ -187,6 +205,7 @@ class Control:
             if got.startswith(("LOOK_ERROR","SAY_DENIED","SAY_ERROR")):raise WirelessError(got)
         raise WirelessError("device receipt timed out")
     def session(self,stream):
+        self._session_generation+=1
         self.current=stream; self.connected=False; self.device_id=self.uptime=self.last_event=self.last_prox=self.last_touch=None; self.peer="none"
         try:
             deadline=time.monotonic()+15
@@ -217,7 +236,8 @@ class Control:
                     if isinstance(stream,TLSStream):
                         stream.command_deadline=item["deadline"]
                         stream.write_stall_timeout=30 if getattr(self,"_owner",None)=="ble" and item["command"] in OPERATION_TIMEOUTS else 8
-                    item["result"]=self.execute(stream,item["command"])
+                    with self.lock:
+                        item["result"]=self.execute(stream,item["command"])
                 except Exception as e:item["result"]=WirelessError(str(e))
                 finally:
                     if isinstance(stream,TLSStream):
@@ -323,6 +343,10 @@ class Control:
             if "result=played" not in receipt or "reset_off=1" not in receipt:
                 raise WirelessError("speaker receipt did not confirm playback and amp reset")
             return {"ok":True,"receipt":receipt[:240]}
+        if command.startswith("verify-cue "):
+            cue=command.removeprefix("verify-cue ")
+            if cue not in {"online","no_update","check_failed"}:raise WirelessError("usage: verify-cue {online|no_update|check_failed}")
+            return self._verify_cue(s,cue,ensure_active)
         if command.startswith("stage "):
             if self.voice is None: self.voice=look_room.load_kokoro_voice()
             text=tap_refresh.spoken_copy(command[6:]); pcm=look_room.synthesize_observation(self.voice,text)
@@ -349,6 +373,88 @@ class Control:
             if r.returncode:raise WirelessError("publish failed")
             return {"ok":True,"id":ident,"receipt":"prepared"}
         raise WirelessError("unsupported operator command")
+
+    def _verify_cue(self,s,cue,ensure_active):
+        # This runs on the authenticated session worker while its I/O lock is held.
+        pin=getattr(self,"expected",None)
+        normalized_pin=pin.lower() if isinstance(pin,str) else ""
+        digest=self.device_id if isinstance(self.device_id,str) else ""
+        if (not self.connected or self.current is not s or
+                not re.fullmatch(r"[0-9a-f]{64}",digest) or
+                not isinstance(pin,str) or not re.fullmatch(r"[0-9a-fA-F]{64}",pin) or
+                normalized_pin!=digest.lower()):
+            raise WirelessError("cue verification requires an authenticated session with the matching ELF pin")
+        nonce=secrets.token_hex(8)
+        transport=getattr(self,"_owner",None) or "wifi"
+        generation=getattr(self,"generation",self._session_generation)
+        identity=(self.current,self.peer,self.device_id,transport,generation)
+        def ensure_same_session():
+            current=(self.current,self.peer,self.device_id,getattr(self,"_owner",None) or "wifi",
+                     getattr(self,"generation",self._session_generation))
+            if not self.connected or self.current is not s or current!=identity:
+                raise WirelessError("authenticated session changed during cue verification")
+        provider={"cue":cue,"provider":"none" if cue=="no_update" else "error","fetch_id":None,"nonce":nonce}
+        item=getattr(self,"_active_item",None)
+        if item is None or item.get("cue_session")!=identity:raise WirelessError("authenticated session changed since cue request was queued")
+        item["verification"]=provider
+        try:
+            ensure_active()
+            ensure_same_session()
+            s.write(f"VERIFY_CUE {cue} {nonce}\n".encode("ascii"))
+            expected_tap_id=None
+            speaker_receipt=None
+            tap_done_seen=False
+            tap_terminal=None
+            until=min(item["deadline"],time.monotonic()+35)
+            while time.monotonic()<until:
+                ensure_active()
+                ensure_same_session()
+                line=self._readline(s,max(.1,min(5,until-time.monotonic())))
+                if line is None:continue
+                if line.startswith("VERIFY_ERROR "):
+                    raise WirelessError("firmware refused cue verification")
+                ensure_same_session()
+                if cue=="online":
+                    if re.fullmatch(rf"VERIFY_DONE {nonce} cue=online outcome=played",line):
+                        if speaker_receipt is None:raise WirelessError("online transaction completed without exact-cue receipt")
+                        ensure_same_session()
+                        return {"ok":True,"cue":cue,"playback_receipt":speaker_receipt,
+                                "transaction_receipt":line,"peer_identity":self.peer,
+                                "device_elf_sha256":self.device_id,"transport":transport,"generation":generation}
+                    if line.startswith("SIMSTIM_SPEAKER "):
+                        expected=rf"SIMSTIM_SPEAKER cue=online result=played stereo_bytes=[1-9][0-9]* status=[0-9a-f]{{4}} reset_off=1 verify={nonce}"
+                        if not re.fullmatch(expected,line) or speaker_receipt is not None:raise WirelessError("wrong or duplicate exact-cue receipt")
+                        speaker_receipt=line
+                        continue
+                else:
+                    fetch=provider.get("fetch_id")
+                    if line.startswith("SIMSTIM_SPEAKER "):
+                        expected_cue=cue
+                        if fetch is None:raise WirelessError("cue receipt arrived before TAP_FETCH")
+                        expected=rf"SIMSTIM_SPEAKER cue={expected_cue} result=played stereo_bytes=[1-9][0-9]* status=[0-9a-f]{{4}} reset_off=1 verify={nonce} tap_id={fetch}"
+                        if not re.fullmatch(expected,line) or speaker_receipt is not None:raise WirelessError("wrong or duplicate exact-cue receipt")
+                        speaker_receipt=line
+                        continue
+                    m=re.fullmatch(r"TAP_DONE ([0-9a-f]{8}) (none|failed)",line)
+                    if m:
+                        expected_outcome="none" if cue=="no_update" else "failed"
+                        if speaker_receipt is None or tap_done_seen or m.group(1)!=fetch or m.group(2)!=expected_outcome:
+                            raise WirelessError("wrong, stale, duplicate, or out-of-order tap terminal")
+                        expected_tap_id=m.group(1);tap_terminal=line;tap_done_seen=True
+                        continue
+                    if line.startswith("VERIFY_DONE "):
+                        expected_outcome="none" if cue=="no_update" else "failed"
+                        exact=f"VERIFY_DONE {nonce} tap_id={expected_tap_id} outcome={expected_outcome}"
+                        if not tap_done_seen or line!=exact:raise WirelessError("wrong, stale, or missing matching tap completion")
+                        ensure_same_session()
+                        return {"ok":True,"cue":cue,"playback_receipt":speaker_receipt,
+                                "tap_receipt":tap_terminal,"transaction_receipt":line,"tap_id":expected_tap_id,
+                                "peer_identity":self.peer,"device_elf_sha256":self.device_id,
+                                "transport":transport,"generation":generation}
+                if line.startswith(("TAP_DONE ","VERIFY_DONE ")):raise WirelessError("unexpected or duplicate transaction receipt")
+            raise WirelessError("cue verification timed out; request was not replayed")
+        finally:
+            item.pop("verification",None)
     def _query(self,s,cmd,key):
         s.write((cmd+"\n").encode()); value=self._expect(s,["TOUCH ","PROX "])
         target=self.last_touch if key=="touch" else self.last_prox
@@ -366,14 +472,14 @@ def tls_listener(key_path=KEYFILE):
     sock=socket.socket(); sock.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); sock.bind((os.environ.get("SIMSTIM_BIND", BIND), int(os.environ.get("SIMSTIM_PORT", str(PORT))))); sock.listen(4); sock.settimeout(.5)
     return sock,tls
 
-def run_operator(control,path=OPSOCK):
+def run_operator(control,path=OPSOCK,*,stop=None):
     path=Path(path); path.parent.mkdir(parents=True,mode=0o700,exist_ok=True)
     if path.exists():
         if not stat.S_ISSOCK(path.stat().st_mode):raise WirelessError("operator socket path exists and is not a socket")
         path.unlink()
     srv=socket.socket(socket.AF_UNIX); srv.bind(str(path)); os.chmod(path,0o600); srv.listen(4); srv.settimeout(.5)
     try:
-        while True:
+        while stop is None or not stop.is_set():
             try:client,_=srv.accept()
             except socket.timeout:continue
             with client:

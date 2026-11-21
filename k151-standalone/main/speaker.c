@@ -24,7 +24,7 @@ static bool aw16(uint8_t r,uint16_t v){uint8_t b[]={r,v>>8,v};return i2c_master_
 static bool rd(i2c_master_dev_handle_t h,uint8_t r,uint8_t*b,size_t n){return i2c_master_transmit_receive(h,&r,1,b,n,100)==ESP_OK;}
 static bool reset_release(bool release){uint8_t b[]={0x02,0};if(!rd(io,2,b+1,1))return false;b[1]=(b[1]&~4)|(release?4:0);return i2c_master_transmit(io,b,2,100)==ESP_OK;}
 static bool attach(i2c_master_bus_handle_t bus,int addr,i2c_master_dev_handle_t*out){i2c_device_config_t c={.device_address=addr,.scl_speed_hz=100000,.dev_addr_length=I2C_ADDR_BIT_LEN_7};return i2c_master_bus_add_device(bus,&c,out)==ESP_OK;}
-static bool play_pcm(const uint8_t *pcm,size_t bytes){
+static bool play_pcm(const uint8_t *pcm,size_t bytes,const char *cue,const char *verification,const char *tap_id){
  size_t sent=0; bool clocks=false,ok=false;uint8_t st[2]={0},v[2]={0};
  if(!reset_release(true)){goto done;}
  vTaskDelay(pdMS_TO_TICKS(50));
@@ -35,14 +35,19 @@ static bool play_pcm(const uint8_t *pcm,size_t bytes){
  for(size_t i=0;i<bytes/2;){int16_t out[256];size_t n=0,w=0;while(n<128 && i<bytes/2){int16_t a=(int16_t)(pcm[2*i]|pcm[2*i+1]<<8);out[2*n]=out[2*n+1]=a/2;n++;i++;}if(i2s_channel_write(tx,out,n*4,&w,300)!=ESP_OK||w!=n*4)goto done;sent+=w;}
  vTaskDelay(pdMS_TO_TICKS(120));ok=rd(amp,1,st,2);
  done:;bool mute=aw16(0x05,0x0018);bool off=aw16(0x04,0x4003);bool held=reset_release(false);if(clocks)i2s_channel_disable(tx);
- bool played=ok&&mute&&off&&held;wire_printf("SIMSTIM_SPEAKER result=%s stereo_bytes=%u status=%02x%02x reset_off=%d\n",played?"played":"failed",(unsigned)sent,st[0],st[1],held);fflush(stdout);return played;
+ bool played=ok&&mute&&off&&held;
+ if(verification && tap_id)wire_printf("SIMSTIM_SPEAKER cue=%s result=%s stereo_bytes=%u status=%02x%02x reset_off=%d verify=%s tap_id=%s\n",cue,played?"played":"failed",(unsigned)sent,st[0],st[1],held,verification,tap_id);
+ else if(verification)wire_printf("SIMSTIM_SPEAKER cue=%s result=%s stereo_bytes=%u status=%02x%02x reset_off=%d verify=%s\n",cue,played?"played":"failed",(unsigned)sent,st[0],st[1],held,verification);
+ else wire_printf("SIMSTIM_SPEAKER result=%s stereo_bytes=%u status=%02x%02x reset_off=%d\n",played?"played":"failed",(unsigned)sent,st[0],st[1],held);
+ fflush(stdout);return played;
 }
-static bool play_status_cue(unsigned cue){
+static bool play_status_cue(unsigned cue,const char *verification,const char *tap_id){
  const int16_t *samples=NULL;size_t count=0;
  if(cue==0){samples=cue_online;count=CUE_ONLINE_SAMPLES;}
  else if(cue==1){samples=cue_no_update;count=CUE_NO_UPDATE_SAMPLES;}
  else if(cue==2){samples=cue_check_failed;count=CUE_CHECK_FAILED_SAMPLES;}
- return samples && play_pcm((const uint8_t*)samples,count*sizeof(*samples));
+ const char *name=cue==0?"online":cue==1?"no_update":"check_failed";
+ return samples && play_pcm((const uint8_t*)samples,count*sizeof(*samples),name,verification,tap_id);
 }
 extern bool board_look_cue(bool camera), look_camera_capture(i2c_master_bus_handle_t), motor_look(i2c_master_bus_handle_t,const char*), motor_calibration_ready(void);
 extern void board_look_end(void);
@@ -56,21 +61,36 @@ static uint32_t tap_boot_nonce; static uint32_t tap_counter; static bool tap_non
 #define TAP_WAIT_MS 15000
 static bool usb_read_exact(uint8_t *dst,size_t len,TickType_t deadline){TickType_t now=xTaskGetTickCount();if((int32_t)(deadline-now)<=0)return false;uint32_t ms=(uint32_t)(deadline-now)*portTICK_PERIOD_MS;return wire_read_exact(dst,len,ms);}
 static bool usb_read_line(char *line,size_t cap,TickType_t deadline){TickType_t now=xTaskGetTickCount();if((int32_t)(deadline-now)<=0)return false;uint32_t ms=(uint32_t)(deadline-now)*portTICK_PERIOD_MS;return wire_read_line(line,cap,ms);}
-static void tap_done(const char *id,const char *result){if(!strcmp(result,"failed"))play_status_cue(2);wire_printf("TAP_DONE %s %s\n",id,result);fflush(stdout);}
+static const char *verification_nonce;
+static void dispatch_look(i2c_master_bus_handle_t bus,const char *cmd);
+static void tap_done(const char *id,const char *result){if(!strcmp(result,"failed"))play_status_cue(2,verification_nonce,verification_nonce?id:NULL);wire_printf("TAP_DONE %s %s\n",id,result);if(verification_nonce)wire_printf("VERIFY_DONE %s tap_id=%s outcome=%s\n",verification_nonce,id,result);fflush(stdout);}
 /* One synchronous request bounds pending work and makes late replies harmless:
    after timeout the next request has a different boot-seeded sequence ID. */
-static void tap_refresh(void){expire_update();if(update_pcm){if(update_owner==wire_owner() && update_session==wire_session())play_pcm(update_pcm,update_bytes);clear_update();return;}
+static void tap_refresh(void){expire_update();if(update_pcm){if(update_owner==wire_owner() && update_session==wire_session())play_pcm(update_pcm,update_bytes,"audio",NULL,NULL);clear_update();return;}
  if(!tap_nonce_ready){tap_boot_nonce=esp_random();tap_counter=0;tap_nonce_ready=true;}uint32_t serial=++tap_counter;uint32_t request_id=tap_boot_nonce+serial;char id[9],expected[40],line[64];snprintf(id,sizeof(id),"%08lx",(unsigned long)request_id);
- wire_printf("TAP_FETCH %s\n",id);fflush(stdout);TickType_t deadline=xTaskGetTickCount()+pdMS_TO_TICKS(TAP_WAIT_MS);
+ if(verification_nonce)wire_printf("TAP_FETCH %s VERIFY %s\n",id,verification_nonce);else wire_printf("TAP_FETCH %s\n",id);fflush(stdout);TickType_t deadline=xTaskGetTickCount()+pdMS_TO_TICKS(TAP_WAIT_MS);
  if(!usb_read_line(line,sizeof(line),deadline)){tap_done(id,"failed");return;}
- snprintf(expected,sizeof(expected),"TAP_NONE %s",id);if(!strcmp(line,expected)){bool played=play_status_cue(1);tap_done(id,played?"none":"failed");return;}
+ snprintf(expected,sizeof(expected),"TAP_NONE %s",id);if(!strcmp(line,expected)){bool played=play_pcm((const uint8_t*)cue_no_update,CUE_NO_UPDATE_SAMPLES*sizeof(*cue_no_update),"no_update",verification_nonce,id);tap_done(id,played?"none":"failed");return;}
  snprintf(expected,sizeof(expected),"TAP_FAIL %s",id);if(!strcmp(line,expected)){tap_done(id,"failed");return;}
  snprintf(expected,sizeof(expected),"TAP_AUDIO %s",id);if(strcmp(line,expected)){tap_done(id,"failed");return;}
  wire_printf("TAP_HEADER %s\n",id);fflush(stdout);uint8_t header[8];if(!usb_read_exact(header,sizeof(header),deadline)){tap_done(id,"failed");return;}
  uint32_t len,crc;memcpy(&len,header,4);memcpy(&crc,header+4,4);if(len<320||len>320000||len%2){tap_done(id,"failed");return;}
  uint8_t *pcm=heap_caps_malloc(len,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);if(!pcm){tap_done(id,"failed");return;}wire_printf("TAP_READY %s\n",id);fflush(stdout);
- if(!usb_read_exact(pcm,len,deadline)||esp_rom_crc32_le(0,pcm,len)!=crc){free(pcm);tap_done(id,"failed");return;}bool played=play_pcm(pcm,len);free(pcm);tap_done(id,played?"played":"failed");}
+ if(!usb_read_exact(pcm,len,deadline)||esp_rom_crc32_le(0,pcm,len)!=crc){free(pcm);tap_done(id,"failed");return;}bool played=play_pcm(pcm,len,"audio",NULL,NULL);free(pcm);tap_done(id,played?"played":"failed");}
 static void tap_update(void){tap_refresh();}
+static bool verification_token_valid(const char *token){if(strlen(token)!=16)return false;for(unsigned i=0;i<16;i++)if(!((token[i]>='0'&&token[i]<='9')||(token[i]>='a'&&token[i]<='f')))return false;return true;}
+static bool verify_status_cue(i2c_master_bus_handle_t bus,const char *cmd){
+ char cue[24],token[24],extra[2];
+ if(sscanf(cmd,"VERIFY_CUE %23s %23s %1s",cue,token,extra)!=2)return false;
+ if(!verification_token_valid(token)||(strcmp(cue,"online")&&strcmp(cue,"no_update")&&strcmp(cue,"check_failed"))){wire_printf("VERIFY_ERROR %s invalid\n",token);return true;}
+ if(strcmp(cue,"online")){
+   expire_update();
+   if(update_pcm){wire_printf("VERIFY_ERROR %s staged\n",token);return true;}
+   verification_nonce=token;dispatch_look(bus,"TAP_CHECK");verification_nonce=NULL;return true;
+ }
+ bool played=play_status_cue(0,token,NULL);
+ wire_printf("VERIFY_DONE %s cue=online outcome=%s\n",token,played?"played":"failed");fflush(stdout);return true;
+}
 static void dispatch_look(i2c_master_bus_handle_t bus,const char *cmd){
  static TickType_t survey_completed; static bool can_speak; static wire_owner_t speak_owner; static uint32_t speak_session;
  /* Reject motor work before cue playback, camera setup, or motor power. Keep
@@ -117,7 +137,7 @@ static void dispatch_look(i2c_master_bus_handle_t bus,const char *cmd){
        if(!n)taskYIELD();
        if(!n && (xTaskGetTickCount()-start)%10==0)vTaskDelay(1);
     }
-    if(got==len && esp_rom_crc32_le(0,pcm,len)==crc){if(staging){clear_update();update_pcm=pcm;pcm=NULL;update_bytes=len;update_crc=crc;update_time=xTaskGetTickCount();update_owner=wire_owner();update_session=wire_session();wire_printf("UPDATE_STAGED\n");}else play_pcm(pcm,len);}else{wire_printf("SAY_ERROR transfer\n");}
+    if(got==len && esp_rom_crc32_le(0,pcm,len)==crc){if(staging){clear_update();update_pcm=pcm;pcm=NULL;update_bytes=len;update_crc=crc;update_time=xTaskGetTickCount();update_owner=wire_owner();update_session=wire_session();wire_printf("UPDATE_STAGED\n");}else play_pcm(pcm,len,"audio",NULL,NULL);}else{wire_printf("SAY_ERROR transfer\n");}
     free(pcm);fflush(stdout);return;
  }
  if(!strcmp(cmd,"LOOK_SURVEY")){
@@ -141,8 +161,8 @@ static void dispatch_look(i2c_master_bus_handle_t bus,const char *cmd){
  if(!ok)wire_printf("LOOK_ERROR operation\n");
  fflush(stdout);
 }
-static void controls(void*bus){bool armed=false,down=false,overflow=false;int idle=0;char cmd[32];size_t used=0;bool active=false;wire_owner_t owner=WIRE_USB;uint32_t session=0;fcntl(0,F_SETFL,O_NONBLOCK);for(;;){bool trigger=false;uint8_t touches=0;if(rd(touch,2,&touches,1)&&touches<=1){if(!touches){if(down&&armed)trigger=true;down=false;if(++idle>=3)armed=true;}else{down=true;idle=0;}}else{armed=false;idle=0;down=false;}
- uint8_t c;for(int j=0;j<32;++j){int n=0;if(active)n=wire_read(&c,1);else{n=usb_serial_jtag_ll_read_rxfifo(&c,1);if(n==1){owner=WIRE_USB;session=0;}else{uint32_t candidate=wifi_link_session();if(candidate){n=wifi_link_read(candidate,&c,1);if(n>0){owner=WIRE_WIFI;session=candidate;}}}if(n>0){if(!wire_transaction_begin(owner,session)){n=0;}else active=true;}}if(n<0){wire_transaction_end();active=false;used=0;overflow=false;break;}if(n!=1)break;if(c=='\n'||c=='\r'){cmd[used]=0;if(!overflow){if(owner==WIRE_USB&&!strcmp(cmd,"WIFI_PROVISION"))simstim_wifi_provision_usb();else if(!strcmp(cmd,"SPEAK_ONLINE"))play_status_cue(0);else dispatch_look(bus,cmd);}used=0;overflow=false;wire_transaction_end();active=false;}else if(c<32||c>126||used>=sizeof(cmd)-1)overflow=true;else cmd[used++]=(char)c;}
+static void controls(void*bus){bool armed=false,down=false,overflow=false;int idle=0;char cmd[64];size_t used=0;bool active=false;wire_owner_t owner=WIRE_USB;uint32_t session=0;fcntl(0,F_SETFL,O_NONBLOCK);for(;;){bool trigger=false;uint8_t touches=0;if(rd(touch,2,&touches,1)&&touches<=1){if(!touches){if(down&&armed)trigger=true;down=false;if(++idle>=3)armed=true;}else{down=true;idle=0;}}else{armed=false;idle=0;down=false;}
+ uint8_t c;for(int j=0;j<32;++j){int n=0;if(active)n=wire_read(&c,1);else{n=usb_serial_jtag_ll_read_rxfifo(&c,1);if(n==1){owner=WIRE_USB;session=0;}else{uint32_t candidate=wifi_link_session();if(candidate){n=wifi_link_read(candidate,&c,1);if(n>0){owner=WIRE_WIFI;session=candidate;}}}if(n>0){if(!wire_transaction_begin(owner,session)){n=0;}else active=true;}}if(n<0){wire_transaction_end();active=false;used=0;overflow=false;break;}if(n!=1)break;if(c=='\n'||c=='\r'){cmd[used]=0;if(!overflow){if(owner==WIRE_USB&&!strcmp(cmd,"WIFI_PROVISION"))simstim_wifi_provision_usb();else if(!strcmp(cmd,"SPEAK_ONLINE"))play_status_cue(0,NULL,NULL);else if(!verify_status_cue(bus,cmd))dispatch_look(bus,cmd);}used=0;overflow=false;wire_transaction_end();active=false;}else if(c<32||c>126||used>=sizeof(cmd)-1)overflow=true;else cmd[used++]=(char)c;}
  expire_update();if(trigger&&!active){armed=false;down=false;idle=0;uint32_t tap_session=wifi_link_session();wire_owner_t tap_owner=tap_session?WIRE_WIFI:WIRE_USB;if(wire_transaction_begin(tap_owner,tap_session)){static uint32_t event_count;uint32_t uptime_ms=(uint32_t)(xTaskGetTickCount()*portTICK_PERIOD_MS);wire_printf("TAP_EVENT %lu %lu\n",(unsigned long)++event_count,(unsigned long)uptime_ms);tap_update();wire_transaction_end();}}vTaskDelay(pdMS_TO_TICKS(40));}}
 bool speaker_init(i2c_master_bus_handle_t bus){if(!attach(bus,0x36,&amp)||!attach(bus,0x38,&touch)||!attach(bus,0x58,&io)||!reset_release(false))return false;
  i2s_chan_config_t ch=I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0,I2S_ROLE_MASTER);ch.auto_clear=true;if(i2s_new_channel(&ch,&tx,NULL)!=ESP_OK)return false;

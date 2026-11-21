@@ -20,7 +20,7 @@ class TapProtocolTests(unittest.TestCase):
 
     def test_only_matching_none_is_no_update(self):
         self.assertIn('snprintf(expected,sizeof(expected),"TAP_NONE %s",id)', SOURCE)
-        self.assertIn('if(!strcmp(line,expected)){bool played=play_status_cue(1)', SOURCE)
+        self.assertIn('if(!strcmp(line,expected)){bool played=play_pcm((const uint8_t*)cue_no_update', SOURCE)
         self.assertIn('snprintf(expected,sizeof(expected),"TAP_FAIL %s",id)', SOURCE)
         self.assertIn('tap_done(id,"failed")', SOURCE)
 
@@ -35,15 +35,23 @@ class TapProtocolTests(unittest.TestCase):
 
     def test_positive_staged_update_and_expiry_remain(self):
         self.assertIn('bool staging=!strcmp(cmd,"STAGE_UPDATE")', SOURCE)
-        self.assertIn('if(update_pcm){if(update_owner==wire_owner() && update_session==wire_session())play_pcm(update_pcm,update_bytes);clear_update();return;}', SOURCE)
+        self.assertIn('if(update_pcm){if(update_owner==wire_owner() && update_session==wire_session())play_pcm(update_pcm,update_bytes,"audio",NULL,NULL);clear_update();return;}', SOURCE)
         self.assertIn('update_owner=wire_owner();update_session=wire_session()', SOURCE)
         self.assertIn('pdMS_TO_TICKS(1800000)', SOURCE)
+
+    def test_status_cues_have_distinct_named_playback_receipts(self):
+        self.assertIn('cue==0?"online":cue==1?"no_update":"check_failed"', SOURCE)
+        self.assertIn('"SIMSTIM_SPEAKER cue=%s result=%s stereo_bytes=%u status=%02x%02x reset_off=%d verify=%s', SOURCE)
+        self.assertIn('play_status_cue(0,token,NULL)', SOURCE)
+        self.assertIn('"VERIFY_CUE %23s %23s %1s",cue,token,extra', SOURCE)
+        self.assertIn('verification_nonce=token;dispatch_look(bus,"TAP_CHECK");verification_nonce=NULL', SOURCE)
+        self.assertIn('if(update_pcm){wire_printf("VERIFY_ERROR %s staged', SOURCE)
 
     def test_online_cue_is_available_on_usb_and_authenticated_wireless(self):
         controls = SOURCE[SOURCE.index("static void controls("):]
         self.assertIn("if(!wire_transaction_begin(owner,session))", controls)
         self.assertIn('owner==WIRE_USB&&!strcmp(cmd,"WIFI_PROVISION")', controls)
-        self.assertIn('else if(!strcmp(cmd,"SPEAK_ONLINE"))play_status_cue(0)', controls)
+        self.assertIn('else if(!strcmp(cmd,"SPEAK_ONLINE"))play_status_cue(0,NULL,NULL)', controls)
         self.assertNotIn('owner==WIRE_USB&&!strcmp(cmd,"SPEAK_ONLINE")', controls)
 
     def test_response_is_bound_to_request_id(self):

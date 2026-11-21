@@ -2,6 +2,8 @@ import ctypes as C, os, socket, sys, tempfile, threading, unittest
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import service
+sys.path.insert(0,str(Path(__file__).resolve().parents[2]/"ble-fallback"/"host"))
+import dual_transport_daemon
 
 def test_listener(key_path):
     original_bind,original_port=service.BIND,service.PORT
@@ -43,6 +45,12 @@ class SimulatedPSKPeer:
         b=C.create_string_buffer(n); size=self.L.SSL_read(self.ssl,b,n)
         if size<=0:raise RuntimeError("synthetic peer TLS read failed")
         return b.raw[:size]
+    def read_line(self):
+        if not hasattr(self,"_read_buffer"):self._read_buffer=bytearray()
+        while b"\n" not in self._read_buffer:self._read_buffer.extend(self.read())
+        index=self._read_buffer.index(b"\n")+1
+        result=bytes(self._read_buffer[:index]);del self._read_buffer[:index]
+        return result
     def close(self):self.L.SSL_free(self.ssl);self.L.SSL_CTX_free(self.ctx)
 
 class PublicEntryPointTests(unittest.TestCase):
@@ -158,6 +166,122 @@ class PublicEntryPointTests(unittest.TestCase):
             op.join(3);self.assertTrue(result and result[0]["ok"])
             self.assertIn("yaw_raw=458",result[0]["receipt"])
             sock.close();peer.close();listener.close();th.join(2)
+    def test_speak_requires_exact_online_cue_playback_receipt(self):
+        class Stream:
+            def __init__(self, line): self.line=line; self.writes=[]
+            def write(self, value): self.writes.append(value); return len(value)
+            def readline(self, **_kwargs): return (self.line+chr(10)).encode()
+        control=service.Control()
+        good=Stream("SIMSTIM_SPEAKER result=played stereo_bytes=2048 status=0000 reset_off=1")
+        self.assertTrue(control.execute(good,"speak")["ok"])
+        self.assertEqual(good.writes,[b"SPEAK_ONLINE"+bytes([10])])
+
+    def test_verify_cue_real_handler_for_both_authenticated_bearers(self):
+        for bearer in ("wifi","ble"):
+            for cue in ("online","no_update","check_failed"):
+                with self.subTest(bearer=bearer,cue=cue), tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as d:
+                    key=bytes(range(32));digest="c"*64
+                    keypath=Path(d)/"key";keypath.write_bytes(key);keypath.chmod(0o600)
+                    listener,tls=test_listener(keypath);control=dual_transport_daemon.SharedControl(Path(d)/"attention.json")
+                    control.expected=digest
+                    state=Path(d)/"attention.json";state.write_text('{"schema":1,"items":{"public":{"reviewed":true,"status":"pending","summary":"untouched"}}}')
+                    original_state=state.read_bytes();ready=threading.Event()
+                    def serve_device():
+                        raw,_=listener.accept();stream=tls.wrap(raw);control.set_transport(bearer);ready.set()
+                        try:control.session(stream)
+                        except service.WirelessError:pass
+                        finally:stream.close();raw.close()
+                    server=threading.Thread(target=serve_device);server.start()
+                    peer=SimulatedPSKPeer(key,service.IDENTITY);sock=socket.create_connection(listener.getsockname());peer.connect(sock)
+                    peer.write((f"SIMSTIM_STANDALONE sha256={digest} uptime_s=11 board_ready=1\n").encode())
+                    self.assertTrue(ready.wait(2))
+                    import time
+                    until=time.monotonic()+2
+                    while not control.connected and time.monotonic()<until:time.sleep(.005)
+                    outcome=[]
+                    op=threading.Thread(target=lambda:outcome.append(control._submit(f"verify-cue {cue}",timeout=8)))
+                    op.start()
+                    request=peer.read_line().decode().strip();self.assertRegex(request,rf"VERIFY_CUE {cue} [0-9a-f]{{16}}")
+                    nonce=request.split()[-1]
+                    if cue=="online":
+                        peer.write((f"SIMSTIM_SPEAKER cue=online result=played stereo_bytes=2048 status=0000 reset_off=1 verify={nonce}\nVERIFY_DONE {nonce} cue=online outcome=played\n").encode())
+                    else:
+                        ident="1a2b3c4d"
+                        peer.write(f"TAP_FETCH {ident} VERIFY {nonce}\n".encode())
+                        provider=peer.read_line().decode().strip()
+                        self.assertEqual(provider,("TAP_NONE " if cue=="no_update" else "TAP_FAIL ")+ident)
+                        result="none" if cue=="no_update" else "failed"
+                        peer.write((f"SIMSTIM_SPEAKER cue={cue} result=played stereo_bytes=2048 status=0000 reset_off=1 verify={nonce} tap_id={ident}\nTAP_DONE {ident} {result}\nVERIFY_DONE {nonce} tap_id={ident} outcome={result}\n").encode())
+                    op.join(5)
+                    self.assertTrue(outcome and outcome[0]["ok"])
+                    self.assertEqual(outcome[0]["transport"],bearer)
+                    self.assertEqual(outcome[0]["device_elf_sha256"],digest)
+                    self.assertIn(f"cue={cue}",outcome[0]["playback_receipt"])
+                    self.assertIn("VERIFY_DONE",outcome[0]["transaction_receipt"])
+                    if cue!="online":self.assertIn("TAP_DONE",outcome[0]["tap_receipt"])
+                    self.assertEqual(state.read_bytes(),original_state)
+                    sock.close();peer.close();listener.close();server.join(2)
+
+    def test_verify_cue_rejects_wrong_missing_stale_duplicate_for_both_bearers(self):
+        cases=(("online","wrong"),("online","missing"),("online","duplicate"),("online","generation"),("online","elf"),("online","peer"),("online","transport"),("online","completion"),
+               ("no_update","wrong"),("no_update","missing"),("no_update","stale"),("no_update","duplicate"),("no_update","staged"),("no_update","generation"),("no_update","completion"),
+               ("check_failed","wrong"),("check_failed","missing"),("check_failed","stale"),("check_failed","duplicate"),("check_failed","staged"),("check_failed","generation"),("check_failed","completion"))
+        for bearer in ("wifi","ble"):
+            for cue,defect in cases:
+                with self.subTest(bearer=bearer,cue=cue,defect=defect), tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as d:
+                    key=bytes(range(32));digest="d"*64
+                    keypath=Path(d)/"key";keypath.write_bytes(key);keypath.chmod(0o600)
+                    listener,tls=test_listener(keypath);control=dual_transport_daemon.SharedControl(Path(d)/"unused.json");control.expected=digest
+                    ready=threading.Event();device_errors=[]
+                    def serve_device():
+                        raw,_=listener.accept();stream=tls.wrap(raw);control.set_transport(bearer);ready.set()
+                        try:control.session(stream)
+                        except Exception as exc:device_errors.append(exc)
+                        finally:stream.close();raw.close()
+                    server=threading.Thread(target=serve_device);server.start()
+                    peer=SimulatedPSKPeer(key,service.IDENTITY);sock=socket.create_connection(listener.getsockname());peer.connect(sock)
+                    peer.write((f"SIMSTIM_STANDALONE sha256={digest} uptime_s=12 board_ready=1\n").encode());self.assertTrue(ready.wait(2))
+                    import time
+                    until=time.monotonic()+2
+                    while not control.connected and time.monotonic()<until:time.sleep(.005)
+                    outcome=[]
+                    def submit():
+                        try:outcome.append(control._submit(f"verify-cue {cue}",timeout=1.5 if defect=="completion" else 6))
+                        except Exception as exc:outcome.append(exc)
+                    op=threading.Thread(target=submit);op.start()
+                    command=peer.read_line().decode().strip();nonce=command.split()[-1]
+                    ident="5e6f7788"
+                    if defect=="staged":
+                        peer.write(f"VERIFY_ERROR {nonce} staged\n".encode());op.join(4)
+                        self.assertTrue(outcome and isinstance(outcome[0],service.WirelessError))
+                        sock.close();peer.close();listener.close();server.join(2)
+                        continue
+                    if cue!="online":
+                        peer.write(f"TAP_FETCH {ident} VERIFY {nonce}\n".encode());peer.read_line()
+                    if defect=="generation":control.generation+=1
+                    if defect=="elf":control.device_id="e"*64
+                    if defect=="peer":control.peer="other-authenticated-peer"
+                    if defect=="transport":control._owner="wifi" if bearer=="ble" else "ble"
+                    expected_cue=cue
+                    if defect=="wrong":expected_cue="check_failed" if cue!="check_failed" else "no_update"
+                    receipt=f"SIMSTIM_SPEAKER cue={expected_cue} result=played stereo_bytes=2048 status=0000 reset_off=1 verify={nonce}"+(f" tap_id={ident}" if cue!="online" else "")
+                    if defect!="missing":
+                        body=receipt+"\n"
+                        if defect=="duplicate":body+=receipt+"\n"
+                    else:body=""
+                    if cue=="online":
+                        body+=f"VERIFY_DONE {nonce} cue=online outcome=played\n"
+                    else:
+                        terminal_id="aaaaaaaa" if defect=="stale" else ident
+                        result="none" if cue=="no_update" else "failed"
+                        body+=f"TAP_DONE {terminal_id} {result}\n"
+                        if defect!="completion":body+=f"VERIFY_DONE {nonce} tap_id={terminal_id} outcome={result}\n"
+                    if cue=="online" and defect=="completion":
+                        body=receipt+"\n"
+                    peer.write(body.encode());op.join(4)
+                    self.assertTrue(outcome and isinstance(outcome[0],service.WirelessError),repr(outcome))
+                    sock.close();peer.close();listener.close();server.join(2)
+
     def test_unsolicited_tap_fetch_is_answered_without_operator(self):
         key=bytes(range(32))
         with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as d:
