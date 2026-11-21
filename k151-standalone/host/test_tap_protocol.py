@@ -20,7 +20,7 @@ class TapProtocolTests(unittest.TestCase):
 
     def test_only_matching_none_is_no_update(self):
         self.assertIn('snprintf(expected,sizeof(expected),"TAP_NONE %s",id)', SOURCE)
-        self.assertIn('if(!strcmp(line,expected)){bool played=play_pcm(quiet_clip', SOURCE)
+        self.assertIn('if(!strcmp(line,expected)){bool played=play_status_cue(1)', SOURCE)
         self.assertIn('snprintf(expected,sizeof(expected),"TAP_FAIL %s",id)', SOURCE)
         self.assertIn('tap_done(id,"failed")', SOURCE)
 
@@ -38,6 +38,13 @@ class TapProtocolTests(unittest.TestCase):
         self.assertIn('if(update_pcm){if(update_owner==wire_owner() && update_session==wire_session())play_pcm(update_pcm,update_bytes);clear_update();return;}', SOURCE)
         self.assertIn('update_owner=wire_owner();update_session=wire_session()', SOURCE)
         self.assertIn('pdMS_TO_TICKS(1800000)', SOURCE)
+
+    def test_online_cue_is_available_on_usb_and_authenticated_wireless(self):
+        controls = SOURCE[SOURCE.index("static void controls("):]
+        self.assertIn("if(!wire_transaction_begin(owner,session))", controls)
+        self.assertIn('owner==WIRE_USB&&!strcmp(cmd,"WIFI_PROVISION")', controls)
+        self.assertIn('else if(!strcmp(cmd,"SPEAK_ONLINE"))play_status_cue(0)', controls)
+        self.assertNotIn('owner==WIRE_USB&&!strcmp(cmd,"SPEAK_ONLINE")', controls)
 
     def test_response_is_bound_to_request_id(self):
         # Every accepted response is built by exact matching against this request.

@@ -17,11 +17,7 @@
 #include "driver/i2c_master.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-/* Upstream cue recordings are not redistributed. These silent cues keep the
- * output path deterministic; speech delivered by the host remains unaffected. */
-static const uint8_t cue_silence[320] = {0};
-#define clip cue_silence
-#define endclip (cue_silence + sizeof(cue_silence))
+#include "status_cues_data.h"
 static i2c_master_dev_handle_t amp,touch,io;
 static i2s_chan_handle_t tx;
 static bool aw16(uint8_t r,uint16_t v){uint8_t b[]={r,v>>8,v};return i2c_master_transmit(amp,b,3,100)==ESP_OK;}
@@ -41,13 +37,18 @@ static bool play_pcm(const uint8_t *pcm,size_t bytes){
  done:;bool mute=aw16(0x05,0x0018);bool off=aw16(0x04,0x4003);bool held=reset_release(false);if(clocks)i2s_channel_disable(tx);
  bool played=ok&&mute&&off&&held;wire_printf("SIMSTIM_SPEAKER result=%s stereo_bytes=%u status=%02x%02x reset_off=%d\n",played?"played":"failed",(unsigned)sent,st[0],st[1],held);fflush(stdout);return played;
 }
+static bool play_status_cue(unsigned cue){
+ const int16_t *samples=NULL;size_t count=0;
+ if(cue==0){samples=cue_online;count=CUE_ONLINE_SAMPLES;}
+ else if(cue==1){samples=cue_no_update;count=CUE_NO_UPDATE_SAMPLES;}
+ else if(cue==2){samples=cue_check_failed;count=CUE_CHECK_FAILED_SAMPLES;}
+ return samples && play_pcm((const uint8_t*)samples,count*sizeof(*samples));
+}
 extern bool board_look_cue(bool camera), look_camera_capture(i2c_master_bus_handle_t), motor_look(i2c_master_bus_handle_t,const char*), motor_calibration_ready(void);
 extern void board_look_end(void);
 extern bool camera_survey_begin(i2c_master_bus_handle_t bus),camera_survey_finish(void);
 extern void camera_survey_glance(unsigned index,void *ctx);
 extern bool motor_survey(i2c_master_bus_handle_t bus,void (*glance)(unsigned,void*),void*);
-#define quiet_clip cue_silence
-#define quiet_end (cue_silence + sizeof(cue_silence))
 static uint8_t *update_pcm; static size_t update_bytes; static uint32_t update_crc; static TickType_t update_time; static wire_owner_t update_owner; static uint32_t update_session;
 static void clear_update(void){free(update_pcm);update_pcm=NULL;update_bytes=0;update_crc=0;}
 static void expire_update(void){if(update_pcm && xTaskGetTickCount()-update_time>=pdMS_TO_TICKS(1800000))clear_update();}
@@ -55,16 +56,14 @@ static uint32_t tap_boot_nonce; static uint32_t tap_counter; static bool tap_non
 #define TAP_WAIT_MS 15000
 static bool usb_read_exact(uint8_t *dst,size_t len,TickType_t deadline){TickType_t now=xTaskGetTickCount();if((int32_t)(deadline-now)<=0)return false;uint32_t ms=(uint32_t)(deadline-now)*portTICK_PERIOD_MS;return wire_read_exact(dst,len,ms);}
 static bool usb_read_line(char *line,size_t cap,TickType_t deadline){TickType_t now=xTaskGetTickCount();if((int32_t)(deadline-now)<=0)return false;uint32_t ms=(uint32_t)(deadline-now)*portTICK_PERIOD_MS;return wire_read_line(line,cap,ms);}
-#define fail_clip cue_silence
-#define fail_end (cue_silence + sizeof(cue_silence))
-static void tap_done(const char *id,const char *result){if(!strcmp(result,"failed"))play_pcm(fail_clip,(size_t)(fail_end-fail_clip));wire_printf("TAP_DONE %s %s\n",id,result);fflush(stdout);}
+static void tap_done(const char *id,const char *result){if(!strcmp(result,"failed"))play_status_cue(2);wire_printf("TAP_DONE %s %s\n",id,result);fflush(stdout);}
 /* One synchronous request bounds pending work and makes late replies harmless:
    after timeout the next request has a different boot-seeded sequence ID. */
 static void tap_refresh(void){expire_update();if(update_pcm){if(update_owner==wire_owner() && update_session==wire_session())play_pcm(update_pcm,update_bytes);clear_update();return;}
  if(!tap_nonce_ready){tap_boot_nonce=esp_random();tap_counter=0;tap_nonce_ready=true;}uint32_t serial=++tap_counter;uint32_t request_id=tap_boot_nonce+serial;char id[9],expected[40],line[64];snprintf(id,sizeof(id),"%08lx",(unsigned long)request_id);
  wire_printf("TAP_FETCH %s\n",id);fflush(stdout);TickType_t deadline=xTaskGetTickCount()+pdMS_TO_TICKS(TAP_WAIT_MS);
  if(!usb_read_line(line,sizeof(line),deadline)){tap_done(id,"failed");return;}
- snprintf(expected,sizeof(expected),"TAP_NONE %s",id);if(!strcmp(line,expected)){bool played=play_pcm(quiet_clip,(size_t)(quiet_end-quiet_clip));tap_done(id,played?"none":"failed");return;}
+ snprintf(expected,sizeof(expected),"TAP_NONE %s",id);if(!strcmp(line,expected)){bool played=play_status_cue(1);tap_done(id,played?"none":"failed");return;}
  snprintf(expected,sizeof(expected),"TAP_FAIL %s",id);if(!strcmp(line,expected)){tap_done(id,"failed");return;}
  snprintf(expected,sizeof(expected),"TAP_AUDIO %s",id);if(strcmp(line,expected)){tap_done(id,"failed");return;}
  wire_printf("TAP_HEADER %s\n",id);fflush(stdout);uint8_t header[8];if(!usb_read_exact(header,sizeof(header),deadline)){tap_done(id,"failed");return;}
@@ -143,7 +142,7 @@ static void dispatch_look(i2c_master_bus_handle_t bus,const char *cmd){
  fflush(stdout);
 }
 static void controls(void*bus){bool armed=false,down=false,overflow=false;int idle=0;char cmd[32];size_t used=0;bool active=false;wire_owner_t owner=WIRE_USB;uint32_t session=0;fcntl(0,F_SETFL,O_NONBLOCK);for(;;){bool trigger=false;uint8_t touches=0;if(rd(touch,2,&touches,1)&&touches<=1){if(!touches){if(down&&armed)trigger=true;down=false;if(++idle>=3)armed=true;}else{down=true;idle=0;}}else{armed=false;idle=0;down=false;}
- uint8_t c;for(int j=0;j<32;++j){int n=0;if(active)n=wire_read(&c,1);else{n=usb_serial_jtag_ll_read_rxfifo(&c,1);if(n==1){owner=WIRE_USB;session=0;}else{uint32_t candidate=wifi_link_session();if(candidate){n=wifi_link_read(candidate,&c,1);if(n>0){owner=WIRE_WIFI;session=candidate;}}}if(n>0){if(!wire_transaction_begin(owner,session)){n=0;}else active=true;}}if(n<0){wire_transaction_end();active=false;used=0;overflow=false;break;}if(n!=1)break;if(c=='\n'||c=='\r'){cmd[used]=0;if(!overflow){if(owner==WIRE_USB&&!strcmp(cmd,"WIFI_PROVISION"))simstim_wifi_provision_usb();else if(!strcmp(cmd,"SPEAK_ONLINE"))play_pcm(clip,(size_t)(endclip-clip));else dispatch_look(bus,cmd);}used=0;overflow=false;wire_transaction_end();active=false;}else if(c<32||c>126||used>=sizeof(cmd)-1)overflow=true;else cmd[used++]=(char)c;}
+ uint8_t c;for(int j=0;j<32;++j){int n=0;if(active)n=wire_read(&c,1);else{n=usb_serial_jtag_ll_read_rxfifo(&c,1);if(n==1){owner=WIRE_USB;session=0;}else{uint32_t candidate=wifi_link_session();if(candidate){n=wifi_link_read(candidate,&c,1);if(n>0){owner=WIRE_WIFI;session=candidate;}}}if(n>0){if(!wire_transaction_begin(owner,session)){n=0;}else active=true;}}if(n<0){wire_transaction_end();active=false;used=0;overflow=false;break;}if(n!=1)break;if(c=='\n'||c=='\r'){cmd[used]=0;if(!overflow){if(owner==WIRE_USB&&!strcmp(cmd,"WIFI_PROVISION"))simstim_wifi_provision_usb();else if(!strcmp(cmd,"SPEAK_ONLINE"))play_status_cue(0);else dispatch_look(bus,cmd);}used=0;overflow=false;wire_transaction_end();active=false;}else if(c<32||c>126||used>=sizeof(cmd)-1)overflow=true;else cmd[used++]=(char)c;}
  expire_update();if(trigger&&!active){armed=false;down=false;idle=0;uint32_t tap_session=wifi_link_session();wire_owner_t tap_owner=tap_session?WIRE_WIFI:WIRE_USB;if(wire_transaction_begin(tap_owner,tap_session)){static uint32_t event_count;uint32_t uptime_ms=(uint32_t)(xTaskGetTickCount()*portTICK_PERIOD_MS);wire_printf("TAP_EVENT %lu %lu\n",(unsigned long)++event_count,(unsigned long)uptime_ms);tap_update();wire_transaction_end();}}vTaskDelay(pdMS_TO_TICKS(40));}}
 bool speaker_init(i2c_master_bus_handle_t bus){if(!attach(bus,0x36,&amp)||!attach(bus,0x38,&touch)||!attach(bus,0x58,&io)||!reset_release(false))return false;
  i2s_chan_config_t ch=I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0,I2S_ROLE_MASTER);ch.auto_clear=true;if(i2s_new_channel(&ch,&tx,NULL)!=ESP_OK)return false;

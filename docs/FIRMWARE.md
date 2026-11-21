@@ -4,29 +4,99 @@ This portable ESP-IDF application targets the ESP32-S3 K151/CoreS3 board. The de
 
 ## Source and third-party notices
 
-Original SIMSTIM firmware is MIT-licensed by the repository `LICENSE`. The Feetech `write_pos.inc` excerpt is included with its accompanying `main/vendor/feetech/LICENSE` notice; do not remove or replace that notice. ESP-IDF and Espressif components are not copied into this repository: they are build dependencies described by the pinned ESP-IDF version and `dependencies.lock`. Their own licenses/notices remain those of their respective distributions.
+Original SIMSTIM firmware is MIT-licensed by the repository `LICENSE`. The narrow Feetech `WritePos` excerpt at `main/vendor/feetech/write_pos.inc` **is bundled** with its accompanying `main/vendor/feetech/LICENSE` notice; do not remove or replace that notice. It remains bundled because replacing the include with a pinned build-time fetch would require changing the firmware build/source integration outside this task's permitted files. The upstream attribution and exact revision are recorded below. ESP-IDF and Espressif components are **not bundled**: they are resolved from the pinned ESP-IDF version and `dependencies.lock`. Their licenses/notices remain those of their respective distributions.
 
-The three locally bundled upstream cue recordings (`main/online.pcm`, `main/no_update.pcm`, and `main/check_failed.pcm`) are deliberately **not redistributed** because their licensing/provenance has not been established. `speaker.c` uses a short silent cue in their place. Host-streamed speech/audio is unchanged. No SDK-generated config, ELF/BIN, flash dump, credential or device record belongs in this source tree.
+Three build-generated Kokoro cues (`Online`, `No update`, and `Check failed`) are linked into the firmware from generated C arrays. Their model and voice assets are not bundled; see [CUES.md](CUES.md) for exact upstream asset URLs, hashes and setup. Host-streamed speech/audio is unchanged. No SDK-generated config, ELF/BIN, flash dump, credential or device record belongs in this source tree.
 
-## Pinned dependencies and offline build
+## Pinned dependencies and clean-clone build
 
-- ESP-IDF: **5.5.6** (exact; `dependencies.lock` resolves the component versions and hashes).
-- Direct managed components: `espressif/esp_video` 2.6.0 and `espressif/esp_cam_sensor` 2.7.0. Transitive component versions/hashes are recorded in `dependencies.lock`.
+- ESP-IDF: **5.5.6** (exact; `dependencies.lock` pins component versions and native content hashes).
+- Direct managed components: `espressif/esp_video` 2.6.0 and `espressif/esp_cam_sensor` 2.7.0. The full resolved dependency set is in `dependencies.lock`.
 - Target: `esp32s3`; board defaults retain the K151 camera/PSRAM, flash mode/size, partition layout, TLS-PSK and USB Serial/JTAG settings.
 
-Install ESP-IDF 5.5.6 and populate an offline component mirror from the exact versions/hashes in `dependencies.lock` before building. `SIMSTIM_COMPONENTS_DIR` must point to a directory containing the extracted, pinned component folders (`cmake_utilities`, `esp_cam_sensor`, `esp_sccb_intf`, `esp_video`, and `usb_host_uvc`). Set `IDF_COMPONENT_MANAGER=0` to prevent registry access; the firmware sources and components are not vendored in this repository. The build has no serial-port or device-write step.
+The project does not bundle Espressif component source. The IDF Component Manager downloads those dependencies using the lock file. An offline mirror is optional; when preparing one, the helper invokes the active IDF Component Manager's native directory-hash verifier against each lock hash before and after copying. It does not treat `.component_hash` as proof by itself. This requires the Python environment installed by ESP-IDF 5.5.6, so source `export.sh` before running the helper. Unsafe, broken, looping, absolute, or escaping symlinks are rejected.
+
+### Clean checkout: install and build from scratch
+
+Use a new checkout and install ESP-IDF 5.5.6 using Espressif's [versioned setup guide](https://docs.espressif.com/projects/esp-idf/en/v5.5.6/esp32s3/get-started/index.html). A standard Linux install can be prepared with these commands (install required OS packages as listed in the guide first):
 
 ```sh
-cd k151-standalone
-export IDF_PATH=/path/to/esp-idf-v5.5.6
-export SIMSTIM_COMPONENTS_DIR=/path/to/offline/components
-export IDF_COMPONENT_MANAGER=0
-./build.sh dual
-# Optional Wi-Fi-only configuration, in a separate build directory:
-SIMSTIM_BUILD_DIR="$PWD/build-wifi" ./build.sh wifi
+mkdir -p "$HOME/esp"
+git clone --recursive --branch v5.5.6 https://github.com/espressif/esp-idf.git "$HOME/esp/esp-idf-v5.5.6"
+cd "$HOME/esp/esp-idf-v5.5.6"
+./install.sh esp32s3
+. ./export.sh
 ```
 
-`build.sh` sets `SDKCONFIG` under the selected build directory (not in the source tree), uses the checked-in defaults, and asks IDF to build only. Keep `sdkconfig`, `sdkconfig.old`, `build/`, `managed_components/`, and generated binaries out of public source control. For online component-manager builds, leave `IDF_COMPONENT_MANAGER` unset and use the locked `dependencies.lock`.
+Then use a new project checkout. The build installs no dependencies into the repository: cue-renderer dependencies/assets are external, and IDF components are pinned in `dependencies.lock`. Only this checkout and those declared dependencies are needed; no sibling project source or pre-populated `managed_components` is required. The online build resolves components against the committed lock.
+
+```sh
+git clone https://github.com/cloudartisan/simstim.git simstim-clean
+cd simstim-clean/k151-standalone
+export IDF_PATH="$HOME/esp/esp-idf-v5.5.6"   # set to your ESP-IDF 5.5.6 installation
+. "$IDF_PATH/export.sh"
+cd ..
+python3 -m pip install --user uv
+uv venv "$HOME/.local/share/simstim/voice/render"
+uv pip install --python "$HOME/.local/share/simstim/voice/render/bin/python" \
+  --require-hashes -r k151-standalone/host/requirements-cues.lock
+mkdir -p "$HOME/.local/share/simstim/voice"
+curl --fail --location --output "$HOME/.local/share/simstim/voice/kokoro-v1.0.onnx" \
+  https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx
+curl --fail --location --output "$HOME/.local/share/simstim/voice/voices-v1.0.bin" \
+  https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
+cd k151-standalone
+unset IDF_COMPONENT_MANAGER SIMSTIM_COMPONENTS_DIR
+SIMSTIM_BUILD_DIR="$HOME/.cache/simstim-k151-dual" ./build.sh dual
+```
+
+For Wi-Fi-only configuration, use a separate build directory:
+
+```sh
+SIMSTIM_BUILD_DIR="$HOME/.cache/simstim-k151-wifi" ./build.sh wifi
+```
+
+Builds compile only; they do not select a serial port, flash, or activate firmware. `build.sh` keeps `SDKCONFIG` under the selected build directory and uses checked-in defaults. Keep `sdkconfig`, `sdkconfig.old`, `build/`, `managed_components/`, and generated binaries out of source control. Provisioning-specific variables are unnecessary for the default compile and no live endpoint or secret is supplied here.
+
+### Optional component mirror
+
+To prepare an offline mirror, resolve dependencies in a new online build first. Keep the resolver output and mirror outside the checkout.
+
+```sh
+cd simstim-clean/k151-standalone
+export IDF_PATH="$HOME/esp/esp-idf-v5.5.6"
+. "$IDF_PATH/export.sh"
+unset IDF_COMPONENT_MANAGER
+idf.py -B "$HOME/.cache/simstim-idf-deps-resolve" set-target esp32s3 reconfigure
+python3 ../scripts/prepare-firmware-components.py --source "$HOME/.cache/simstim-idf-deps-resolve/managed_components" --destination "$HOME/.cache/simstim-idf-components"
+```
+
+Then build offline using the mirror:
+
+```sh
+cd simstim-clean/k151-standalone
+export IDF_PATH="$HOME/esp/esp-idf-v5.5.6"
+. "$IDF_PATH/export.sh"
+export SIMSTIM_COMPONENTS_DIR="$HOME/.cache/simstim-idf-components"
+export IDF_COMPONENT_MANAGER=0
+SIMSTIM_BUILD_DIR="$HOME/.cache/simstim-k151-offline" ./build.sh dual
+```
+
+The resolver needs registry access. Do not substitute similarly named components or refresh `dependencies.lock` during routine setup; review lock-file changes as dependency updates.
+
+### Historical patch disposition and provenance
+
+The local history audit identified five patch artifacts with no source URL/sign-off provenance. They are **not redistributed** or applied by this project. The public firmware is the standalone implementation in this directory; the table records whether each historical behavior is already present, intentionally absent, or superseded so the old patches are not mistaken for build inputs.
+
+| Historical artifact | Disposition in this public firmware | Public implementation / boundary |
+|---|---|---|
+| `simstim-k151-source.patch` | Superseded as a whole; it modifies a different StackChan/Xiaozhi application tree. | Standalone K151 app, board startup, wire protocol, host link and screen are implemented in `main/`; no alternate application patch is required. |
+| `simstim-k151-tls-unprovisioned.patch` | Superseded as a patch; its secure local-link intent is independently implemented. | `wifi_link.c` and `ble_channel.c` use TLS-PSK; no production endpoint/key is embedded. Public defaults are deliberately unusable. See configuration/provisioning docs. |
+| `simstim-k151-offline-trial.patch` | Historical trial patch, not a public patch input. | Standalone firmware independently includes read-only proximity status and camera/motor commands; proximity does not autonomously trigger speech or movement. No trial image, selector operation or device-specific calibration is included. |
+| `ltr553-proximity.patch` | Patch superseded; sensor readout behavior is independently implemented. | `board.c` validates the LTR-553 identity/configuration and exposes sampled counts/status. Missing or invalid sensor state is reported unavailable; this does not establish calibrated distance or presence. |
+| `k151-clock-commissioning.delta.patch` | Superseded commissioning delta; not part of the standalone release. | The public app reports uptime, not wall-clock time. No RTC/NTP/clock commissioning behavior is claimed or included. Add a separately reviewed clock feature only if a public use case requires it. |
+
+For motion timing, the narrow `FeetechScs::WritePos` implementation in `main/vendor/feetech/write_pos.inc` is retained with its MIT notice and pinned source comment: [kisaragi-mochi/stackchan-mcp at `03fbd92774c37844e11ea097e632df28f2a5f4e5`](https://github.com/kisaragi-mochi/stackchan-mcp/tree/03fbd92774c37844e11ea097e632df28f2a5f4e5/firmware/components/feetech_scs). SIMSTIM's echo-aware servo transport and validation are separate local code; this attribution does not cover other historical patch content. Do not copy vendor patches or calibration values from a particular device into a public build.
 
 For host-native source checks, run from the repository root:
 
