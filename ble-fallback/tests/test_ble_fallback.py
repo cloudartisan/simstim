@@ -66,7 +66,7 @@ class BleFallbackTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(BusyError): await o.acquire("peer-b")
         with self.assertRaises(PermissionError): o.mark_tls_authenticated("peer-a","wrong","cipher")
         self.assertFalse(o.authenticated)
-        o.mark_tls_authenticated("peer-a","device","TLS-PSK")
+        o.mark_tls_authenticated("peer-a","simstim-device","TLS-PSK")
         self.assertTrue(o.authenticated)
         with patch("bluez_gatt.time.monotonic", return_value=100.0):
             o.release("peer-a")
@@ -77,6 +77,13 @@ class BleFallbackTests(unittest.IsolatedAsyncioTestCase):
             o.release("peer-a")
             self.assertEqual(o.backoff_s, 2)
         self.assertFalse(o.authenticated); self.assertIsNone(o.device)
+    async def test_owner_default_matches_existing_wifi_tls_identity(self):
+        with patch.dict(os.environ, {}, clear=True):
+            owner = Owner()
+            await owner.acquire("peer-default")
+            owner.mark_tls_authenticated("peer-default", service.IDENTITY, "TLS-PSK")
+            self.assertTrue(owner.authenticated)
+
     async def test_queue_bounded_and_stream_order(self):
         q=BoundedByteQueue(cap=4)
         await q.put(b"ab"); await q.put(b"cd")

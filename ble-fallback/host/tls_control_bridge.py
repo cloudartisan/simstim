@@ -113,7 +113,7 @@ class TLSControlBridge:
             if not cipher:
                 raise PermissionError("TLS cipher negotiation failed")
             if self.owner is not None:
-                self.owner.mark_tls_authenticated(session.peer, os.environ.get("SIMSTIM_PEER_IDENTITY", "device"), cipher[0])
+                self.owner.mark_tls_authenticated(session.peer, os.environ.get("SIMSTIM_PEER_IDENTITY", "simstim-device"), cipher[0])
             if hasattr(self.control, "set_transport"):
                 self.control.set_transport("ble")
             self.control.session(stream)

@@ -64,7 +64,7 @@ class Owner:
                 raise BusyError("BLE reconnect backoff active")
             self.device, self.authenticated = device, False
     def mark_tls_authenticated(self, device, identity: str, cipher: str):
-        if self.device != device or identity != os.environ.get("SIMSTIM_PEER_IDENTITY", "device") or not cipher:
+        if self.device != device or identity != os.environ.get("SIMSTIM_PEER_IDENTITY", "simstim-device") or not cipher:
             raise PermissionError("TLS peer/owner authentication failed")
         self.authenticated = True
         self._retry_count = 0

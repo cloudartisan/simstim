@@ -8,7 +8,7 @@ Local-first device firmware and a companion host for the M5Stack StackChan K151.
 - **Host:** `wireless-control/` and `ble-fallback/host/`. On Wi-Fi the device opens a TLS connection over TCP; on Bluetooth it transports TLS over a GATT service. An operator or application talks to the local host rather than an unauthenticated command server on the board.
 - **On demand:** screen taps, spoken updates, bounded movement, proximity reads and camera capture. A device playback receipt is not a claim that someone heard a message. A supported command is not proof that every combination of firmware, radio and hardware has been tested.
 
-See [host setup](docs/HOST.md) and [firmware setup](docs/FIRMWARE.md) to configure the address, port and device identity. Then follow [USB provisioning](docs/PROVISIONING.md) to install your own network credentials and device key without rebuilding the firmware. Keep Wi-Fi credentials and per-installation keys outside source control. Never flash an unverified image or overwrite your only recovery copy.
+See [host setup](docs/HOST.md) for declared dependencies, the optional non-activating dual-radio systemd user-service template, isolated host tests, and the wire-parity acceptance checklist. See [firmware setup](docs/FIRMWARE.md) to configure the address, port and device identity. Then follow [USB provisioning](docs/PROVISIONING.md) to install your own network credentials and device key without rebuilding the firmware. Keep Wi-Fi credentials and per-installation keys outside source control. Never flash an unverified image or overwrite your only recovery copy.
 
 ## Development and adoption
 

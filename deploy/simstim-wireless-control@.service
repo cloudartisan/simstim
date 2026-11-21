@@ -1,0 +1,25 @@
+[Unit]
+Description=SIMSTIM dual-radio host gateway (%i)
+After=network-online.target bluetooth.service
+Wants=network-online.target bluetooth.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Projects/simstim-delivery
+Environment=HOME=%h
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-%h/.config/simstim/%i.env
+ExecStart=%h/.local/share/simstim/host-venv/bin/python %h/Projects/simstim-delivery/ble-fallback/host/dual_transport_daemon.py --adapter ${SIMSTIM_BLUEZ_ADAPTER} --key ${SIMSTIM_KEY_PATH} --operator-socket ${SIMSTIM_OPERATOR_SOCKET} --state ${SIMSTIM_STATE_PATH}
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/simstim-wireless %h/.local/state/simstim-attention %h/.local/state/simstim
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=default.target
