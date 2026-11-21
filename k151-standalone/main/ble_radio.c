@@ -14,6 +14,8 @@
 #include "host/ble_gap.h"
 #include "host/ble_gatt.h"
 #include "host/ble_hs.h"
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 
@@ -218,6 +220,12 @@ bool ble_radio_open(unsigned timeout_ms)
 
     if (!radio_stack_started) {
         if (nimble_port_init() != ESP_OK) return false;
+        /* Register only the standard discovery responders before the host
+         * task starts. Application control and room-data characteristics stay
+         * client-only; this firmware does not advertise or initiate scanning.
+         */
+        ble_svc_gap_init();
+        ble_svc_gatt_init();
         ble_hs_cfg.sync_cb = sync_callback;
         nimble_port_freertos_init(host_task);
         radio_stack_started = true;
