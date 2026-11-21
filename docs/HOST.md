@@ -32,7 +32,7 @@ Set configuration in the environment or a protected environment file. `SIMSTIM_*
 | `SIMSTIM_KEY_PATH` | `~/.local/state/simstim-wireless/device.psk` | 32 raw PSK bytes, regular file mode 0600 |
 | `SIMSTIM_OPERATOR_SOCKET` | `~/.local/state/simstim-wireless/operator.sock` | Local JSON-line operator socket |
 | `SIMSTIM_ATTENTION_STATE` | `~/.local/state/simstim-attention/state.json` | Reviewed tap state |
-| `SIMSTIM_RELEASE_ELF_PATH` | `k151-standalone/build/k151_standalone.elf` | Optional matching firmware ELF for vision checks; set explicitly when `SIMSTIM_BUILD_DIR` changes |
+| `SIMSTIM_RELEASE_ELF_PATH` | legacy fixed build path | New builds use a unique directory. Set this explicitly to the matching candidate ELF; the host does not auto-select a recent build. |
 | `SIMSTIM_ELF_SHA256` | unset | Expected lowercase firmware ELF digest |
 | `SIMSTIM_SERIAL_PORT` | `/dev/ttyUSB0` | USB serial device for the optional tap listener |
 
@@ -97,7 +97,7 @@ SIMSTIM_KEY_PATH=/home/REPLACE_WITH_ACCOUNT/.local/state/simstim-wireless/device
 SIMSTIM_OPERATOR_SOCKET=/home/REPLACE_WITH_ACCOUNT/.local/state/simstim-wireless/operator.sock
 SIMSTIM_STATE_PATH=/home/REPLACE_WITH_ACCOUNT/.local/state/simstim/state.json
 SIMSTIM_ATTENTION_STATE=/home/REPLACE_WITH_ACCOUNT/.local/state/simstim-attention/state.json
-SIMSTIM_RELEASE_ELF_PATH=/home/REPLACE_WITH_ACCOUNT/Projects/simstim-delivery/k151-standalone/build/k151_standalone.elf
+SIMSTIM_RELEASE_ELF_PATH=/absolute/path/to/the/exact-mode-candidate/k151_standalone.elf
 SIMSTIM_ELF_SHA256=REPLACE_WITH_VERIFIED_64_HEX_FIRMWARE_DIGEST
 SIMSTIM_BLUEZ_ADAPTER=/org/bluez/hci0
 EOF

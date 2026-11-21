@@ -12,7 +12,7 @@ if [[ -z "${IDF_TOOLS_PATH:-}" ]]; then
     IDF_TOOLS_PATH="$HOME/.espressif"
   fi
 fi
-BUILD_DIR="${SIMSTIM_BUILD_DIR:-$ROOT/build}"
+BUILD_ROOT="${SIMSTIM_BUILD_DIR:-$ROOT/build}"
 MODE="${1:-dual}"
 case "$MODE" in
   dual) DEFAULTS="$ROOT/sdkconfig.defaults;$ROOT/sdkconfig.ble.defaults" ;;
@@ -27,8 +27,11 @@ if [[ -z "${IDF_PYTHON_ENV_PATH:-}" && -x "$IDF_TOOLS_PATH/penvs/$IDF_VERSION/bi
   IDF_PYTHON_ENV_PATH="$IDF_TOOLS_PATH/penvs/$IDF_VERSION"
 fi
 export IDF_TOOLS_PATH IDF_PATH IDF_PYTHON_ENV_PATH
-mkdir -p "$BUILD_DIR"
-BUILD_DIR="$(cd -- "$BUILD_DIR" && pwd)"
+mkdir -p "$BUILD_ROOT"
+BUILD_ROOT="$(cd -- "$BUILD_ROOT" && pwd)"
+# Never reuse a generated config or build output across modes or revisions.
+# Each invocation gets a new candidate directory; existing artifacts are untouched.
+BUILD_DIR="$(mktemp -d "$BUILD_ROOT/${MODE}-candidate.XXXXXXXX")"
 FEETECH_SOURCE_DIR="${BUILD_DIR}.feetech-source"
 FEETECH_SOURCE="$FEETECH_SOURCE_DIR/write_pos.inc"
 export SIMSTIM_FEETECH_SOURCE_DIR="$FEETECH_SOURCE_DIR"

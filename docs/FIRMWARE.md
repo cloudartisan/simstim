@@ -1,6 +1,6 @@
 # K151 standalone dual-radio firmware
 
-This portable ESP-IDF application targets the ESP32-S3 K151/CoreS3 board. The default `dual` build includes the Wi-Fi TLS transport and BLE GATT/TLS fallback; `wifi` omits NimBLE. The application keeps board startup fail-closed: it first confirms the servo power gate is configured and read back low before declaring the board ready. The project does not flash, select a serial device, or activate firmware as part of a build.
+This portable ESP-IDF application targets the ESP32-S3 K151/CoreS3 board. The default `dual` build includes Wi-Fi TLS and BLE GATT/TLS fallback; `wifi` omits NimBLE. The application keeps board startup fail-closed: it first confirms the servo power gate is configured and read back low before declaring the board ready. The project does not flash, select a serial device, or activate firmware as part of a build.
 
 ## Source and third-party notices
 
@@ -67,13 +67,13 @@ unset IDF_COMPONENT_MANAGER SIMSTIM_COMPONENTS_DIR
 SIMSTIM_BUILD_DIR="$HOME/.cache/simstim-k151-dual" ./build.sh dual
 ```
 
-For Wi-Fi-only configuration, use a separate build directory:
+For Wi-Fi-only configuration, select `wifi` explicitly; both modes can safely share the same output root:
 
 ```sh
-SIMSTIM_BUILD_DIR="$HOME/.cache/simstim-k151-wifi" ./build.sh wifi
+SIMSTIM_BUILD_DIR="$HOME/.cache/simstim-k151" ./build.sh wifi
 ```
 
-Builds compile only; they do not select a serial port, flash, or activate firmware. `build.sh` keeps `SDKCONFIG` under the selected build directory and uses checked-in defaults. Keep `sdkconfig`, `sdkconfig.old`, `build/`, `managed_components/`, and generated binaries out of source control. Provisioning-specific variables are unnecessary for the default compile and no live endpoint or secret is supplied here.
+Each invocation creates a new mode-labelled candidate directory beneath `SIMSTIM_BUILD_DIR` (default: `k151-standalone/build`). It passes that candidate's absolute `sdkconfig` explicitly to IDF, so generated configuration and build products are not reused across modes or overwritten on later invocations. Existing configs and outputs in the chosen build root are left untouched; keep generated candidate directories out of source control. Builds compile only; they do not select a serial port, flash, or activate firmware. Provisioning-specific variables are unnecessary for the default compile and no live endpoint or secret is supplied here.
 
 ### Optional component mirror
 
