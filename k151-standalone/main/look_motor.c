@@ -86,7 +86,11 @@ static bool calibration_valid(void)
         MOTOR_YAW_MIN_DEG >= -180 && MOTOR_YAW_MAX_DEG <= 180 &&
         MOTOR_YAW_MIN_DEG < MOTOR_YAW_MAX_DEG &&
         MOTOR_PITCH_MIN_DEG >= -180 && MOTOR_PITCH_MAX_DEG <= 180 &&
-        MOTOR_PITCH_MIN_DEG < MOTOR_PITCH_MAX_DEG;
+        MOTOR_PITCH_MIN_DEG < MOTOR_PITCH_MAX_DEG &&
+        (SIMSTIM_MOTOR_SURVEY_ENTRY_ENABLED == 0 ||
+         (SIMSTIM_MOTOR_SURVEY_ENTRY_ENABLED == 1 &&
+          SIMSTIM_MOTOR_SURVEY_ENTRY_MIN_PITCH_DEG >= -180 &&
+          SIMSTIM_MOTOR_SURVEY_ENTRY_MIN_PITCH_DEG < MOTOR_PITCH_MIN_DEG));
 }
 
 bool motor_calibration_ready(void) { return calibration_valid(); }
@@ -118,7 +122,8 @@ static int deg_for_raw(int zero, int raw, int direction)
 #endif
 }
 
-static bool pose_from_raw(int yaw_raw, int pitch_raw, motor_pose_t *pose)
+static bool pose_from_raw(int yaw_raw, int pitch_raw, motor_pose_t *pose,
+                          bool allow_survey_entry)
 {
     if (!pose || yaw_raw < 0 || yaw_raw > 1000 ||
         pitch_raw < 0 || pitch_raw > 1000) return false;
@@ -126,8 +131,13 @@ static bool pose_from_raw(int yaw_raw, int pitch_raw, motor_pose_t *pose)
     pose->pitch_raw = pitch_raw;
     pose->yaw_deg = deg_for_raw(MOTOR_YAW_ZERO_RAW, yaw_raw, MOTOR_YAW_DIRECTION);
     pose->pitch_deg = deg_for_raw(MOTOR_PITCH_ZERO_RAW, pitch_raw, MOTOR_PITCH_DIRECTION);
+    bool normal_pitch = pose->pitch_deg >= MOTOR_PITCH_MIN_DEG &&
+                        pose->pitch_deg <= MOTOR_PITCH_MAX_DEG;
+    bool entry_pitch = allow_survey_entry && SIMSTIM_MOTOR_SURVEY_ENTRY_ENABLED &&
+                       pose->pitch_deg >= SIMSTIM_MOTOR_SURVEY_ENTRY_MIN_PITCH_DEG &&
+                       pose->pitch_deg < MOTOR_PITCH_MIN_DEG;
     return pose->yaw_deg >= MOTOR_YAW_MIN_DEG && pose->yaw_deg <= MOTOR_YAW_MAX_DEG &&
-           pose->pitch_deg >= MOTOR_PITCH_MIN_DEG && pose->pitch_deg <= MOTOR_PITCH_MAX_DEG;
+           (normal_pitch || entry_pitch);
 }
 
 static bool add_py32(i2c_master_bus_handle_t bus)
@@ -293,7 +303,7 @@ static bool read_pose(motor_pose_t *pose)
     int yaw, pitch;
     if (!read_word(MOTOR_YAW_ID, MOTOR_REG_PRESENT_POS, &yaw) ||
         !read_word(MOTOR_PITCH_ID, MOTOR_REG_PRESENT_POS, &pitch) ||
-        !pose_from_raw(yaw, pitch, pose)) return false;
+        !pose_from_raw(yaw, pitch, pose, false)) return false;
     s_yaw_sample_tick = s_pitch_sample_tick = xTaskGetTickCount();
     return true;
 }
@@ -510,7 +520,8 @@ static bool begin_session(i2c_master_bus_handle_t bus, const char *action,
                   !released || !rail_off ? "shutdown_unconfirmed" : "start_readback_failed");
         return false;
     }
-    if (!pose_from_raw(yaw_raw, pitch_raw, start)) {
+    bool entry_action = strcmp(action, "survey") == 0 || strcmp(action, "HOME") == 0;
+    if (!pose_from_raw(yaw_raw, pitch_raw, start, entry_action)) {
         bool released = torque_release();
         bool off = rail_set(false);
         s_busy = false;
@@ -549,12 +560,22 @@ static bool begin_session(i2c_master_bus_handle_t bus, const char *action,
     return true;
 }
 
-/* No automatic entry correction: uncalibrated or unsupported poses stop here. */
+/* Optional, bounded low-pitch correction is only reachable from survey/HOME. */
 static bool survey_entry(const motor_pose_t *start, motor_pose_t *actual)
 {
-    return start && actual && calibration_valid() &&
-           start->yaw_deg >= MOTOR_YAW_MIN_DEG && start->yaw_deg <= MOTOR_YAW_MAX_DEG &&
-           start->pitch_deg >= MOTOR_PITCH_MIN_DEG && start->pitch_deg <= MOTOR_PITCH_MAX_DEG;
+    if (!start || !actual || !calibration_valid() ||
+        start->yaw_deg < MOTOR_YAW_MIN_DEG || start->yaw_deg > MOTOR_YAW_MAX_DEG)
+        return false;
+    if (start->pitch_deg >= MOTOR_PITCH_MIN_DEG && start->pitch_deg <= MOTOR_PITCH_MAX_DEG)
+        return true;
+    if (!SIMSTIM_MOTOR_SURVEY_ENTRY_ENABLED ||
+        start->pitch_deg < SIMSTIM_MOTOR_SURVEY_ENTRY_MIN_PITCH_DEG ||
+        start->pitch_deg >= MOTOR_PITCH_MIN_DEG)
+        return false;
+    motor_pose_t entry_goal;
+    if (!pose_at(start->yaw_deg, MOTOR_PITCH_MIN_DEG, &entry_goal)) return false;
+    s_stage = "survey_entry_inward";
+    return move_pose(&entry_goal, actual);
 }
 
 typedef struct {

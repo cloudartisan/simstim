@@ -30,6 +30,10 @@ static int goal_history_count[2] = {0, 0};
 static int delayed_onset_ms;
 static int ignore_next_goal;
 static int stall_next_goal;
+static int drop_servo_replies;
+static int drop_after_next_motion_goal;
+static int unsafe_after_next_motion_goal;
+static int make_next_position_read_unsafe;
 static int motion_active[3];
 static int motion_start_pos[3], motion_goal[3];
 static TickType_t motion_started[3];
@@ -120,8 +124,14 @@ int uart_write_bytes(uart_port_t u, const char *data, size_t n) {
             return (int)n;
         }
         if (tx[5] == 66 || tx[5] == 56) update_motion(id);
+        if (tx[5] == 56 && count == 2 && make_next_position_read_unsafe) {
+            make_next_position_read_unsafe = 0;
+            int unsafe = test_raw_at_deg(SIMSTIM_MOTOR_YAW_ZERO_RAW, 50,
+                                         SIMSTIM_MOTOR_YAW_DIRECTION);
+            regs[1][56] = (uint8_t)(unsafe >> 8); regs[1][57] = (uint8_t)unsafe;
+        }
         for (uint8_t i=0; i<count; ++i) payload[i] = regs[id][(uint8_t)(tx[5] + i)];
-        queue_frame(id, payload, count);
+        if (!drop_servo_replies) queue_frame(id, payload, count);
     } else if (inst == 0x03) {
         uint8_t addr = tx[5], count = (uint8_t)(n - 7);
         assert(id > 0 && id < 3);
@@ -145,13 +155,21 @@ int uart_write_bytes(uart_port_t u, const char *data, size_t n) {
                 motion_duration[id] = duration; motion_delay[id] = delayed_onset_ms;
                 motion_stall[id] = stall_next_goal; delayed_onset_ms = 0; stall_next_goal = 0;
                 motion_active[id] = 1; regs[id][66] = 0;
+                if (drop_after_next_motion_goal) {
+                    drop_after_next_motion_goal = 0;
+                    drop_servo_replies = 1;
+                }
+                if (unsafe_after_next_motion_goal) {
+                    unsafe_after_next_motion_goal = 0;
+                    make_next_position_read_unsafe = 1;
+                }
             }
         } else if (addr == 40 && count == 1) {
             torque_writes++; regs[id][40] = tx[6];
         } else {
             other_servo_writes++;
         }
-        queue_frame(id, NULL, 0);
+        if (!drop_servo_replies) queue_frame(id, NULL, 0);
     }
     return (int)n;
 }
@@ -253,11 +271,95 @@ int main(int argc, char **argv) {
         assert((expander[0x05] & 1) == 0);
         return 0;
     }
+    if (strcmp(argv[1], "entry_low") == 0) {
+        int pitch = test_raw_at_deg(SIMSTIM_MOTOR_PITCH_ZERO_RAW, 4,
+                                    SIMSTIM_MOTOR_PITCH_DIRECTION);
+        regs[2][56] = (uint8_t)(pitch >> 8); regs[2][57] = (uint8_t)pitch;
+        int ok = motor_survey((void *)0x1, NULL, NULL);
+        if (SIMSTIM_MOTOR_SURVEY_ENTRY_ENABLED) {
+            assert(ok);
+            assert(goal_history_count[1] >= 2);
+            assert(goal_history[1][1] == test_raw_at_deg(SIMSTIM_MOTOR_PITCH_ZERO_RAW,
+                   SIMSTIM_MOTOR_PITCH_MIN_DEG, SIMSTIM_MOTOR_PITCH_DIRECTION));
+            assert(goal_history[1][goal_history_count[1]-1] ==
+                   test_raw_at_deg(SIMSTIM_MOTOR_PITCH_ZERO_RAW, 30,
+                                   SIMSTIM_MOTOR_PITCH_DIRECTION));
+            for (int i = 1; i < goal_history_count[1]; ++i) {
+                int deg = (goal_history[1][i] - SIMSTIM_MOTOR_PITCH_ZERO_RAW) *
+                          SIMSTIM_MOTOR_RAW_PER_DEG_DEN / SIMSTIM_MOTOR_RAW_PER_DEG_NUM;
+                assert(deg >= SIMSTIM_MOTOR_PITCH_MIN_DEG &&
+                       deg <= SIMSTIM_MOTOR_PITCH_MAX_DEG);
+            }
+        } else {
+            assert(!ok && goal_writes == 0);
+        }
+        assert((expander[0x05] & 1) == 0);
+        return 0;
+    }
+    if (strcmp(argv[1], "entry_forbidden") == 0) {
+        int pitch = test_raw_at_deg(SIMSTIM_MOTOR_PITCH_ZERO_RAW, 2,
+                                    SIMSTIM_MOTOR_PITCH_DIRECTION);
+        regs[2][56] = (uint8_t)(pitch >> 8); regs[2][57] = (uint8_t)pitch;
+        assert(!motor_survey((void *)0x1, NULL, NULL));
+        assert(goal_writes == 0 && cue_calls == 0);
+        assert((expander[0x05] & 1) == 0);
+        return 0;
+    }
+    if (strcmp(argv[1], "home_entry_low") == 0) {
+        int pitch = test_raw_at_deg(SIMSTIM_MOTOR_PITCH_ZERO_RAW, 4,
+                                    SIMSTIM_MOTOR_PITCH_DIRECTION);
+        regs[2][56] = (uint8_t)(pitch >> 8); regs[2][57] = (uint8_t)pitch;
+        int ok = motor_look((void *)0x1, "HOME");
+        if (SIMSTIM_MOTOR_SURVEY_ENTRY_ENABLED) {
+            assert(ok);
+            assert(goal_history_count[1] >= 3);
+            assert(goal_history[1][1] == test_raw_at_deg(SIMSTIM_MOTOR_PITCH_ZERO_RAW,
+                   SIMSTIM_MOTOR_PITCH_MIN_DEG, SIMSTIM_MOTOR_PITCH_DIRECTION));
+            assert(goal_history[1][goal_history_count[1]-1] ==
+                   test_raw_at_deg(SIMSTIM_MOTOR_PITCH_ZERO_RAW, 30,
+                                   SIMSTIM_MOTOR_PITCH_DIRECTION));
+        } else {
+            assert(!ok && goal_writes == 0);
+        }
+        assert((expander[0x05] & 1) == 0);
+        return 0;
+    }
+    if (strcmp(argv[1], "relative_low_pitch") == 0) {
+        int pitch = test_raw_at_deg(SIMSTIM_MOTOR_PITCH_ZERO_RAW, 4,
+                                    SIMSTIM_MOTOR_PITCH_DIRECTION);
+        regs[2][56] = (uint8_t)(pitch >> 8); regs[2][57] = (uint8_t)pitch;
+        assert(!motor_look((void *)0x1, "LEFT"));
+        assert(goal_writes == 0);
+        assert((expander[0x05] & 1) == 0);
+        return 0;
+    }
     if (strcmp(argv[1], "home") == 0) {
+        int yaw = test_raw_at_deg(SIMSTIM_MOTOR_YAW_ZERO_RAW, 7,
+                                  SIMSTIM_MOTOR_YAW_DIRECTION);
+        int pitch = test_raw_at_deg(SIMSTIM_MOTOR_PITCH_ZERO_RAW, 28,
+                                    SIMSTIM_MOTOR_PITCH_DIRECTION);
+        regs[1][56] = (uint8_t)(yaw >> 8); regs[1][57] = (uint8_t)yaw;
+        regs[2][56] = (uint8_t)(pitch >> 8); regs[2][57] = (uint8_t)pitch;
         assert(motor_look((void *)1, "HOME"));
         assert(goal_history[0][goal_history_count[0]-1] == test_raw_at_deg(SIMSTIM_MOTOR_YAW_ZERO_RAW, 0, SIMSTIM_MOTOR_YAW_DIRECTION));
         assert(goal_history[1][goal_history_count[1]-1] == test_raw_at_deg(SIMSTIM_MOTOR_PITCH_ZERO_RAW, 30, SIMSTIM_MOTOR_PITCH_DIRECTION));
         assert(regs[1][40] == 0 && regs[2][40] == 0 && !(expander[5] & 1)); return 0;
+    }
+    if (strcmp(argv[1], "LEFT") == 0 || strcmp(argv[1], "RIGHT") == 0 ||
+        strcmp(argv[1], "UP") == 0 || strcmp(argv[1], "DOWN") == 0) {
+        int yaw_deg = strcmp(argv[1], "LEFT") == 0 ? -5 :
+                      strcmp(argv[1], "RIGHT") == 0 ? 5 : 0;
+        int pitch_deg = strcmp(argv[1], "UP") == 0 ? 35 :
+                        strcmp(argv[1], "DOWN") == 0 ? 25 : 30;
+        assert(motor_look((void *)1, argv[1]));
+        assert(goal_history[0][goal_history_count[0]-1] ==
+               test_raw_at_deg(SIMSTIM_MOTOR_YAW_ZERO_RAW, yaw_deg,
+                               SIMSTIM_MOTOR_YAW_DIRECTION));
+        assert(goal_history[1][goal_history_count[1]-1] ==
+               test_raw_at_deg(SIMSTIM_MOTOR_PITCH_ZERO_RAW, pitch_deg,
+                               SIMSTIM_MOTOR_PITCH_DIRECTION));
+        assert(regs[1][40] == 0 && regs[2][40] == 0 && !(expander[5] & 1));
+        return 0;
     }
     if (strcmp(argv[1], "survey") == 0) {
         int pitch = test_raw_at_deg(SIMSTIM_MOTOR_PITCH_ZERO_RAW, 30, SIMSTIM_MOTOR_PITCH_DIRECTION);
@@ -295,16 +397,36 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "survey_delayed") == 0 ||
         strcmp(argv[1], "survey_ignored_goal") == 0 ||
-        strcmp(argv[1], "survey_stalled") == 0) {
+        strcmp(argv[1], "survey_stalled") == 0 ||
+        strcmp(argv[1], "survey_link_loss") == 0 ||
+        strcmp(argv[1], "survey_unsafe_readback") == 0) {
         if (strcmp(argv[1], "survey_delayed") == 0) delayed_onset_ms = 150;
         if (strcmp(argv[1], "survey_ignored_goal") == 0) ignore_next_goal = 1;
         if (strcmp(argv[1], "survey_stalled") == 0) stall_next_goal = 1;
+        if (strcmp(argv[1], "survey_link_loss") == 0) drop_after_next_motion_goal = 1;
+        if (strcmp(argv[1], "survey_unsafe_readback") == 0) unsafe_after_next_motion_goal = 1;
         int ok = motor_survey((void *)0x1, NULL, NULL);
         if (strcmp(argv[1], "survey_delayed") == 0) {
             assert(ok && goal_history_count[1] >= 2);
         } else {
-            assert(!ok && goal_history_count[1] == 2);
-            assert(goal_history[1][1] == test_raw_at_deg(SIMSTIM_MOTOR_PITCH_ZERO_RAW, 38, SIMSTIM_MOTOR_PITCH_DIRECTION));
+            assert(!ok);
+            assert(goal_history_count[0] <= 2);
+            assert(goal_history[0][0] == test_raw_at_deg(SIMSTIM_MOTOR_YAW_ZERO_RAW,
+                   0, SIMSTIM_MOTOR_YAW_DIRECTION)); /* initial hold only */
+            if (strcmp(argv[1], "survey_link_loss") == 0) {
+                assert(goal_history_count[0] == 2); /* one attempted waypoint, no rollback */
+                assert(goal_history_count[1] == 1); /* failed yaw write prevented pitch command */
+            } else if (strcmp(argv[1], "survey_unsafe_readback") == 0) {
+                assert(goal_history_count[0] == 2 && goal_history_count[1] == 2);
+                assert(goal_history[0][1] == test_raw_at_deg(SIMSTIM_MOTOR_YAW_ZERO_RAW,
+                       -30, SIMSTIM_MOTOR_YAW_DIRECTION));
+                assert(goal_history[1][1] == test_raw_at_deg(SIMSTIM_MOTOR_PITCH_ZERO_RAW,
+                       38, SIMSTIM_MOTOR_PITCH_DIRECTION)); /* original waypoint pair only */
+            } else {
+                assert(goal_history_count[1] == 2);
+                assert(goal_history[1][1] == test_raw_at_deg(SIMSTIM_MOTOR_PITCH_ZERO_RAW,
+                       38, SIMSTIM_MOTOR_PITCH_DIRECTION));
+            }
             assert(regs[1][40] == 0 && regs[2][40] == 0);
             assert((expander[0x05] & 1) == 0);
         }

@@ -1,5 +1,7 @@
 import os
+import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -22,15 +24,21 @@ SYNTHETIC = {
     "PITCH_DIRECTION": 1,
     "YAW_MIN_DEG": -35,
     "YAW_MAX_DEG": 35,
-    "PITCH_MIN_DEG": 0,
+    "PITCH_MIN_DEG": 5,
     "PITCH_MAX_DEG": 40,
+    "SURVEY_ENTRY_ENABLED": 0,
+    "SURVEY_ENTRY_MIN_PITCH_DEG": 0,
 }
+
+ENTRY = {**SYNTHETIC, "SURVEY_ENTRY_ENABLED": 1,
+         "SURVEY_ENTRY_MIN_PITCH_DEG": 3}
 
 CONFIGS = {
     "synthetic": SYNTHETIC,
     "omitted": {key: 0 for key in SYNTHETIC},
     "partial": {**{key: 0 for key in SYNTHETIC}, "YAW_ZERO_RAW": 500},
     "invalid": {**SYNTHETIC, "YAW_DIRECTION": 0},
+    "entry": ENTRY,
 }
 
 
@@ -150,6 +158,87 @@ class MotorBehaviorTests(unittest.TestCase):
                 result = self.run_scenario(scenario)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_low_pitch_entry_is_opt_in_and_moves_inward_before_survey(self):
+        denied = self.run_scenario("entry_low", "synthetic")
+        self.assertEqual(denied.returncode, 0, denied.stdout + denied.stderr)
+        allowed = self.run_scenario("entry_low", "entry")
+        self.assertEqual(allowed.returncode, 0, allowed.stdout + allowed.stderr)
+
+    def test_entry_rejects_pitch_below_configured_floor(self):
+        result = self.run_scenario("entry_forbidden", "entry")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_low_pitch_absolute_home_is_opt_in_and_returns_to_center(self):
+        denied = self.run_scenario("home_entry_low", "synthetic")
+        self.assertEqual(denied.returncode, 0, denied.stdout + denied.stderr)
+        allowed = self.run_scenario("home_entry_low", "entry")
+        self.assertEqual(allowed.returncode, 0, allowed.stdout + allowed.stderr)
+
+    def test_cmake_entry_configuration_defaults_and_rejects_invalid_opt_in(self):
+        cmake = shutil.which("cmake")
+        if cmake is None:
+            candidates = sorted(Path.home().glob(".cache/esphome/idf/tools/cmake/*/bin/cmake"))
+            candidates += sorted(Path.home().glob(".espressif/tools/cmake/*/bin/cmake"))
+            cmake = str(candidates[-1]) if candidates else None
+        if cmake is None:
+            self.skipTest("CMake is required to exercise public_config.cmake")
+        cmake_config = ROOT / "public_config.cmake"
+        with tempfile.TemporaryDirectory(prefix="simstim-motor-config-") as temp:
+            project = Path(temp)
+            (project / "CMakeLists.txt").write_text(
+                f'cmake_minimum_required(VERSION 3.16)\nproject(config NONE)\ninclude("{cmake_config}")\n'
+            )
+
+            def configure(name, updates):
+                build = project / name
+                env = {k: v for k, v in os.environ.items()
+                       if not k.startswith("SIMSTIM_MOTOR_")}
+                env.update(updates)
+                return subprocess.run([cmake, "-S", str(project), "-B", str(build)],
+                                      env=env, capture_output=True, text=True)
+
+            default = configure("default", {})
+            self.assertEqual(default.returncode, 0, default.stdout + default.stderr)
+            header = (project / "default/generated/simstim_public_config.h").read_text()
+            self.assertIn("SIMSTIM_MOTOR_CALIBRATION_ENABLED 0", header)
+            self.assertIn("SIMSTIM_MOTOR_SURVEY_ENTRY_ENABLED 0", header)
+
+            calibration = {
+                "SIMSTIM_MOTOR_YAW_ZERO_RAW": "500",
+                "SIMSTIM_MOTOR_PITCH_ZERO_RAW": "500",
+                "SIMSTIM_MOTOR_RAW_PER_DEG_NUM": "4",
+                "SIMSTIM_MOTOR_RAW_PER_DEG_DEN": "1",
+                "SIMSTIM_MOTOR_YAW_DIRECTION": "1",
+                "SIMSTIM_MOTOR_PITCH_DIRECTION": "1",
+                "SIMSTIM_MOTOR_YAW_MIN_DEG": "-35",
+                "SIMSTIM_MOTOR_YAW_MAX_DEG": "35",
+                "SIMSTIM_MOTOR_PITCH_MIN_DEG": "5",
+                "SIMSTIM_MOTOR_PITCH_MAX_DEG": "40",
+            }
+            opted = configure("opted", {**calibration,
+                "SIMSTIM_MOTOR_SURVEY_ENTRY_ENABLED": "1",
+                "SIMSTIM_MOTOR_SURVEY_ENTRY_MIN_PITCH_DEG": "3"})
+            self.assertEqual(opted.returncode, 0, opted.stdout + opted.stderr)
+            header = (project / "opted/generated/simstim_public_config.h").read_text()
+            self.assertIn("SIMSTIM_MOTOR_SURVEY_ENTRY_ENABLED 1", header)
+            self.assertIn("SIMSTIM_MOTOR_SURVEY_ENTRY_MIN_PITCH_DEG 3", header)
+
+            for name, updates in (
+                ("entry_without_calibration", {
+                    "SIMSTIM_MOTOR_SURVEY_ENTRY_ENABLED": "1",
+                    "SIMSTIM_MOTOR_SURVEY_ENTRY_MIN_PITCH_DEG": "3"}),
+                ("missing_floor", {**calibration,
+                    "SIMSTIM_MOTOR_SURVEY_ENTRY_ENABLED": "1"}),
+                ("floor_not_below_motion", {**calibration,
+                    "SIMSTIM_MOTOR_SURVEY_ENTRY_ENABLED": "1",
+                    "SIMSTIM_MOTOR_SURVEY_ENTRY_MIN_PITCH_DEG": "5"}),
+                ("floor_without_enable", {**calibration,
+                    "SIMSTIM_MOTOR_SURVEY_ENTRY_MIN_PITCH_DEG": "3"}),
+            ):
+                with self.subTest(name=name):
+                    result = configure(name, updates)
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_survey_enters_inward_slowly_from_near_boundary_and_releases(self):
         result = self.run_scenario("survey_entry")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -158,21 +247,33 @@ class MotorBehaviorTests(unittest.TestCase):
         result = self.run_scenario("survey_delayed")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_survey_ignored_goal_stops_without_retry(self):
-        result = self.run_scenario("survey_ignored_goal")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("stage=survey_waypoint_1", result.stdout)
-        self.assertIn("yaw_raw=500", result.stdout)
+    def test_failed_survey_never_commands_rollback_after_actuation_uncertainty(self):
+        for scenario in ("survey_ignored_goal", "survey_stalled", "survey_link_loss",
+                         "survey_unsafe_readback"):
+            with self.subTest(scenario=scenario):
+                result = self.run_scenario(scenario)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("result=failed action=survey", result.stdout)
+                self.assertNotIn("survey_rollback", result.stdout)
 
-    def test_survey_stall_stops_without_retry(self):
+    def test_failed_survey_timeout_releases_without_a_second_motor_command(self):
         result = self.run_scenario("survey_stalled")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("stage=survey_waypoint_1", result.stdout)
-        self.assertIn("yaw_raw=440", result.stdout)
+        self.assertIn("result=failed action=survey", result.stdout)
+
+    def test_low_pitch_entry_does_not_expand_relative_look_envelope(self):
+        result = self.run_scenario("relative_low_pitch", "entry")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_absolute_home_from_offset(self):
         result = self.run_scenario("home")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_public_pan_and_tilt_directions_remain_bounded(self):
+        for direction in ("LEFT", "RIGHT", "UP", "DOWN"):
+            with self.subTest(direction=direction):
+                result = self.run_scenario(direction)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_survey_keeps_both_waypoints_and_returns_to_synthetic_home(self):
         result = self.run_scenario("survey")
