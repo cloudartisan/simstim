@@ -29,6 +29,17 @@ fi
 export IDF_TOOLS_PATH IDF_PATH IDF_PYTHON_ENV_PATH
 mkdir -p "$BUILD_DIR"
 BUILD_DIR="$(cd -- "$BUILD_DIR" && pwd)"
+FEETECH_SOURCE_DIR="${BUILD_DIR}.feetech-source"
+FEETECH_SOURCE="$FEETECH_SOURCE_DIR/write_pos.inc"
+export SIMSTIM_FEETECH_SOURCE_DIR="$FEETECH_SOURCE_DIR"
+FEETECH_ARGS=(--destination "$FEETECH_SOURCE")
+if [[ -n "${SIMSTIM_FEETECH_MIRROR:-}" ]]; then
+  FEETECH_ARGS+=(--mirror "$SIMSTIM_FEETECH_MIRROR")
+fi
+if [[ "${SIMSTIM_OFFLINE:-0}" == "1" ]]; then
+  FEETECH_ARGS+=(--offline)
+fi
+python3 "$ROOT/../scripts/prepare-feetech-source.py" "${FEETECH_ARGS[@]}"
 export SDKCONFIG="$BUILD_DIR/sdkconfig"
 export SDKCONFIG_DEFAULTS="$DEFAULTS"
 # Source the pinned framework environment, then target an out-of-source build.
@@ -41,6 +52,7 @@ if [[ "$ACTUAL_IDF_VERSION" != "ESP-IDF v$IDF_VERSION" ]]; then
 fi
 "$IDF_PATH/tools/idf.py" -C "$ROOT" -B "$BUILD_DIR" \
   -D "SDKCONFIG=$SDKCONFIG" \
+  -D "SIMSTIM_FEETECH_SOURCE_DIR=$FEETECH_SOURCE_DIR" \
   -D "SIMSTIM_CUE_MODEL=${SIMSTIM_CUE_MODEL:-$HOME/.local/share/simstim/voice/kokoro-v1.0.onnx}" \
   -D "SIMSTIM_CUE_VOICES=${SIMSTIM_CUE_VOICES:-$HOME/.local/share/simstim/voice/voices-v1.0.bin}" \
   -D "SIMSTIM_CUE_PYTHON=${SIMSTIM_CUE_PYTHON:-$HOME/.local/share/simstim/voice/render/bin/python}" \

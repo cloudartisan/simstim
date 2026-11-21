@@ -4,7 +4,7 @@ This portable ESP-IDF application targets the ESP32-S3 K151/CoreS3 board. The de
 
 ## Source and third-party notices
 
-Original SIMSTIM firmware is MIT-licensed by the repository `LICENSE`. The narrow Feetech `WritePos` excerpt at `main/vendor/feetech/write_pos.inc` **is bundled** with its accompanying `main/vendor/feetech/LICENSE` notice; do not remove or replace that notice. It remains bundled because replacing the include with a pinned build-time fetch would require changing the firmware build/source integration outside this task's permitted files. The upstream attribution and exact revision are recorded below. ESP-IDF and Espressif components are **not bundled**: they are resolved from the pinned ESP-IDF version and `dependencies.lock`. Their licenses/notices remain those of their respective distributions.
+Original SIMSTIM firmware is MIT-licensed by the repository `LICENSE`. This revision no longer bundles the Feetech source excerpt. Earlier revisions still contain the previously attributed copy. The build prepares only the `WritePos` function from the immutable upstream revision recorded in `k151-standalone/feetech-source.lock`; the complete fetched source is checked against its pinned SHA-256 before extraction. Prepared files live in a sibling generated dependency directory adjacent to the selected build directory, not in the source tree or CMake build directory. ESP-IDF and Espressif components are **not bundled**: they are resolved from the pinned ESP-IDF version and `dependencies.lock`. Their licenses/notices remain those of their respective distributions.
 
 Three build-generated Kokoro cues (`Online`, `No update`, and `Check failed`) are linked into the firmware from generated C arrays. Their model and voice assets are not bundled; see [CUES.md](CUES.md) for exact upstream asset URLs, hashes and setup. Host-streamed speech/audio is unchanged. No SDK-generated config, ELF/BIN, flash dump, credential or device record belongs in this source tree.
 
@@ -15,6 +15,23 @@ Three build-generated Kokoro cues (`Online`, `No update`, and `Check failed`) ar
 - Target: `esp32s3`; board defaults retain the K151 camera/PSRAM, flash mode/size, partition layout, TLS-PSK and USB Serial/JTAG settings.
 
 The project does not bundle Espressif component source. The IDF Component Manager downloads those dependencies using the lock file. An offline mirror is optional; when preparing one, the helper invokes the active IDF Component Manager's native directory-hash verifier against each lock hash before and after copying. It does not treat `.component_hash` as proof by itself. This requires the Python environment installed by ESP-IDF 5.5.6, so source `export.sh` before running the helper. Unsafe, broken, looping, absolute, or escaping symlinks are rejected.
+
+### Pinned Feetech source preparation
+
+`build.sh` downloads the full upstream `feetech_scs.cpp` from the immutable commit and checks its complete SHA-256 against `feetech-source.lock`. It then extracts only the `WritePos` definition into the sibling generated dependency directory adjacent to the selected build directory. A mirror is the original upstream file, not the generated excerpt; the same hash check runs for both network and mirror input, so changing the source while leaving any mirror marker untouched is rejected. The `WritePos` implementation and command regression are compiled by the host motor tests. To make a verified mirror, obtain the file from the locked URL and verify it before storing it outside the checkout:
+
+```sh
+mkdir -p "$HOME/.cache/simstim-upstream/feetech"
+curl --fail --location --output "$HOME/.cache/simstim-upstream/feetech/feetech_scs.cpp" \
+  'https://raw.githubusercontent.com/kisaragi-mochi/stackchan-mcp/03fbd92774c37844e11ea097e632df28f2a5f4e5/firmware/components/feetech_scs/feetech_scs.cpp'
+printf '%s  %s\n' \
+  'c5309d884091328456237e5c62486b892a6192e6ea272895b364f765f0b31f38' \
+  "$HOME/.cache/simstim-upstream/feetech/feetech_scs.cpp" | sha256sum --check
+SIMSTIM_FEETECH_MIRROR="$HOME/.cache/simstim-upstream/feetech" \
+SIMSTIM_OFFLINE=1 SIMSTIM_BUILD_DIR="$HOME/.cache/simstim-k151-offline" ./build.sh dual
+```
+
+Without a mirror, `build.sh` fetches from the pinned URL. `SIMSTIM_OFFLINE=1` requires `SIMSTIM_FEETECH_MIRROR`; it fails instead of reaching the network if no mirror is supplied. The preparer verifies bytes itself on every invocation, regardless of a checksum file or marker alongside the mirror.
 
 ### Clean checkout: install and build from scratch
 
@@ -96,7 +113,7 @@ The local history audit identified five patch artifacts with no source URL/sign-
 | `ltr553-proximity.patch` | Patch superseded; sensor readout behavior is independently implemented. | `board.c` validates the LTR-553 identity/configuration and exposes sampled counts/status. Missing or invalid sensor state is reported unavailable; this does not establish calibrated distance or presence. |
 | `k151-clock-commissioning.delta.patch` | Superseded commissioning delta; not part of the standalone release. | The public app reports uptime, not wall-clock time. No RTC/NTP/clock commissioning behavior is claimed or included. Add a separately reviewed clock feature only if a public use case requires it. |
 
-For motion timing, the narrow `FeetechScs::WritePos` implementation in `main/vendor/feetech/write_pos.inc` is retained with its MIT notice and pinned source comment: [kisaragi-mochi/stackchan-mcp at `03fbd92774c37844e11ea097e632df28f2a5f4e5`](https://github.com/kisaragi-mochi/stackchan-mcp/tree/03fbd92774c37844e11ea097e632df28f2a5f4e5/firmware/components/feetech_scs). SIMSTIM's echo-aware servo transport and validation are separate local code; this attribution does not cover other historical patch content. Do not copy vendor patches or calibration values from a particular device into a public build.
+For motion timing, the `WritePos` definition is fetched from [kisaragi-mochi/stackchan-mcp at `03fbd92774c37844e11ea097e632df28f2a5f4e5`](https://github.com/kisaragi-mochi/stackchan-mcp/tree/03fbd92774c37844e11ea097e632df28f2a5f4e5/firmware/components/feetech_scs); the exact raw-file URL and SHA-256 are in `k151-standalone/feetech-source.lock`. SIMSTIM's echo-aware servo transport, validation, test harness, and regression coverage are local code. The upstream component's license at that pinned revision is MIT (see its [LICENSE](https://github.com/kisaragi-mochi/stackchan-mcp/blob/03fbd92774c37844e11ea097e632df28f2a5f4e5/firmware/components/feetech_scs/LICENSE)); the original notice is retained at `k151-standalone/main/vendor/feetech/LICENSE`. Keep that notice with generated copies of the upstream code. The source excerpt is generated only in the sibling dependency directory adjacent to the selected build directory and is not tracked. Do not copy vendor patches or calibration values from a particular device into a public build.
 
 For host-native source checks, run from the repository root:
 

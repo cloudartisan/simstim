@@ -9,6 +9,12 @@ set(SIMSTIM_CUE_VOICES "$ENV{HOME}/.local/share/simstim/voice/voices-v1.0.bin" C
 set(SIMSTIM_CUE_PYTHON "$ENV{HOME}/.local/share/simstim/voice/render/bin/python" CACHE FILEPATH "Python with pinned Kokoro build dependencies")
 set(SIMSTIM_CUE_OUTPUT "${CMAKE_BINARY_DIR}/generated-cues")
 set(CUE_GENERATOR "${CMAKE_CURRENT_LIST_DIR}/../tools/generate_cues.py")
+if(NOT SIMSTIM_FEETECH_SOURCE_DIR)
+    set(SIMSTIM_FEETECH_SOURCE_DIR "$ENV{SIMSTIM_FEETECH_SOURCE_DIR}")
+endif()
+if(NOT EXISTS "${SIMSTIM_FEETECH_SOURCE_DIR}/write_pos.inc")
+    message(FATAL_ERROR "Pinned Feetech WritePos source missing. Run build.sh to prepare it; see docs/FIRMWARE.md.")
+endif()
 if(NOT EXISTS "${SIMSTIM_CUE_MODEL}" OR NOT EXISTS "${SIMSTIM_CUE_VOICES}" OR NOT EXISTS "${SIMSTIM_CUE_PYTHON}")
     message(FATAL_ERROR "Status cue build dependencies missing. See docs/CUES.md and set SIMSTIM_CUE_MODEL, SIMSTIM_CUE_VOICES, SIMSTIM_CUE_PYTHON.")
 endif()
@@ -37,4 +43,4 @@ idf_component_register(
         freertos
         log
 )
-target_include_directories(${COMPONENT_LIB} PRIVATE "${SIMSTIM_GENERATED_INCLUDE_DIR}" "${SIMSTIM_CUE_OUTPUT}")
+target_include_directories(${COMPONENT_LIB} PRIVATE "${SIMSTIM_GENERATED_INCLUDE_DIR}" "${SIMSTIM_CUE_OUTPUT}" "${SIMSTIM_FEETECH_SOURCE_DIR}")

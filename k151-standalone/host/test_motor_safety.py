@@ -1,3 +1,4 @@
+import os
 import subprocess
 import unittest
 from pathlib import Path
@@ -7,6 +8,7 @@ HARNESS = ROOT / "host" / "motor_behavior_harness.c"
 FAKES = ROOT / "host" / "fakes"
 CONFIG_TEMPLATE = ROOT / "public_config.h.in"
 SCRATCH = Path.home() / ".hermes" / "cache" / "scratch" / "k151-motor-behavior"
+PREPARE_FEETECH = ROOT.parent / "scripts" / "prepare-feetech-source.py"
 
 # Deliberately synthetic settings: 4 raw units/degree, zero at 500, and
 # generous limits around the harness's bounded center/survey trajectory.
@@ -49,10 +51,17 @@ class MotorBehaviorTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         SCRATCH.mkdir(parents=True, exist_ok=True)
+        feetech_dir = SCRATCH / "feetech"
+        feetech_args = ["python3", str(PREPARE_FEETECH), "--destination",
+                        str(feetech_dir / "write_pos.inc")]
+        mirror = os.environ.get("SIMSTIM_FEETECH_MIRROR")
+        if mirror:
+            feetech_args.extend(["--mirror", mirror, "--offline"])
+        subprocess.run(feetech_args, check=True, capture_output=True, text=True)
         obj = SCRATCH / "servo_position.o"
         subprocess.run(
             ["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-c",
-             str(ROOT / "main/servo_position.cpp"), "-o", str(obj)], check=True
+             "-I", str(feetech_dir), str(ROOT / "main/servo_position.cpp"), "-o", str(obj)], check=True
         )
         cls.binaries = {}
         for name, values in CONFIGS.items():
@@ -82,6 +91,10 @@ class MotorBehaviorTests(unittest.TestCase):
 
     def test_synthetic_calibration_is_explicitly_ready(self):
         result = self.run_scenario("synthetic_ready")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_pinned_writepos_preserves_big_endian_position_and_duration_command(self):
+        result = self.run_scenario("writepos_wire_words")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_probe_filters_self_echo_reads_both_servos_and_only_toggles_rail_gate(self):

@@ -172,6 +172,14 @@ static void defaults(void) {
 static void synthetic_cue(unsigned view, void *context) { (void)view; (void)context; cue_calls++; }
 int main(int argc, char **argv) {
     assert(argc == 2); defaults();
+    if (strcmp(argv[1], "writepos_wire_words") == 0) {
+        assert(simstim_timed_position(1, 0x123, 0x456));
+        assert(goal_writes == 1 && goal_history_count[0] == 1);
+        assert(goal_history[0][0] == 0x123);
+        assert(goal_profile_ms[0][0] == 0x456);
+        assert(goal_profile_speed[0][0] == 0);
+        return 0;
+    }
     if (strcmp(argv[1], "synthetic_ready") == 0) {
         assert(motor_calibration_ready());
         return 0;
