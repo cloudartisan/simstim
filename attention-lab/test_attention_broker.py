@@ -3,11 +3,14 @@ import json
 import subprocess
 import sys
 import tempfile
+from unittest.mock import patch
 import unittest
+import struct
+import zlib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-from tap_refresh import public_summary
+from tap_refresh import public_summary, serve_fetch, spoken_copy
 
 
 CLI = Path(__file__).with_name("attention_broker.py")
@@ -39,6 +42,75 @@ class BrokerE2E(unittest.TestCase):
     def put(self):
         return self.cli("put", "--id", "result-1", "--public-summary",
                         "Build complete; 12 checks passed.", "--reviewed")
+
+    def test_public_publish_claim_fetch_firmware_receipt_and_no_replay(self):
+        """Exercise public CLI and actual fetch handler with a fake firmware stream."""
+        clock = patch("tap_refresh.time.time", return_value=self.now)
+        clock.start()
+        self.addCleanup(clock.stop)
+        pcm = bytes((i % 251 for i in range(640)))
+
+        class FirmwareStream:
+            def __init__(self, receipts):
+                self.receipts = iter(receipts)
+                self.output = bytearray()
+
+            def write(self, data):
+                self.output.extend(data)
+                return len(data)
+
+            def flush(self):
+                pass
+
+            def readline(self, _limit):
+                return next(self.receipts).encode("ascii") + b"\n"
+
+        # A real first fetch against isolated, absent state is acknowledged empty.
+        first = FirmwareStream(["TAP_DONE 11111111 none"])
+        self.assertEqual(serve_fetch(first, "TAP_FETCH 11111111", self.state, None,
+                                     lambda _engine, _text: pcm, progress_source=lambda *_: (None, None)), "none")
+        self.assertEqual(first.output, b"TAP_NONE 11111111\n")
+
+        # Publish through the public CLI, then exercise the public cue claim.
+        text = "The build passed."
+        self.assertEqual(self.cli("put", "--id", "result-1", "--public-summary", text, "--reviewed")["status"], "stored")
+        claimed = self.cli("claim-cue", "--id", "result-1", "--session-id", "synthetic-session")
+        self.assertEqual(claimed["status"], "claimed")
+
+        second = FirmwareStream(["TAP_HEADER 22222222", "TAP_READY 22222222",
+                                 "TAP_DONE 22222222 played"])
+        def render(_engine, summary):
+            self.assertEqual(spoken_copy(summary), text)
+            return pcm
+        self.assertEqual(serve_fetch(second, "TAP_FETCH 22222222", self.state, None, render,
+                                     progress_source=lambda *_: (None, None)), "played")
+        self.assertEqual(second.output[:19], b"TAP_AUDIO 22222222\n")
+        length, crc = struct.unpack("<II", second.output[19:27])
+        self.assertEqual((length, crc), (len(pcm), zlib.crc32(pcm) & 0xffffffff))
+        self.assertEqual(second.output[27:], pcm)
+
+        # The host claims before sending, so the next tap cannot replay this brief.
+        third = FirmwareStream(["TAP_DONE 33333333 none"])
+        self.assertEqual(serve_fetch(third, "TAP_FETCH 33333333", self.state, None,
+                                     lambda *_: self.fail("renderer must not run on empty"),
+                                     progress_source=lambda *_: (None, None)), "none")
+        self.assertEqual(third.output, b"TAP_NONE 33333333\n")
+
+    def test_unavailable_provider_is_failure_not_empty(self):
+        class FirmwareStream:
+            def __init__(self):
+                self.output = bytearray()
+                self.receipts = iter(["TAP_DONE aaaaaaaa failed"])
+            def write(self, data): self.output.extend(data)
+            def flush(self): pass
+            def readline(self, _limit): return next(self.receipts).encode() + b"\n"
+
+        stream = FirmwareStream()
+        def unavailable(*_args):
+            raise OSError("synthetic provider unavailable")
+        self.assertEqual(serve_fetch(stream, "TAP_FETCH aaaaaaaa", self.state, None,
+                                     progress_source=unavailable), "failed")
+        self.assertEqual(stream.output, b"TAP_FAIL aaaaaaaa\n")
 
     def test_persisted_idempotent_put_and_single_cue_tap_retrieval(self):
         self.assertEqual(self.put()["status"], "stored")

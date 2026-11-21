@@ -10,7 +10,7 @@ From this directory, run:
 python3 -m unittest -v
 ```
 
-The suite launches the CLI in separate processes against persisted temporary state, tests idempotent result storage, cue-once behavior, tap-once retrieval, stale/replay/unknown and quiet paths, and reads a synthetic JSONL touch event with the documented fields (`event_type`, `subtype`, `duration_ms`, `ts`, `ts_unix`, `session_id`). All event fixtures are synthetic; no sensor, room monitoring, network, or physical hardware is used.
+The suite launches the CLI in separate processes against persisted temporary state, tests idempotent result storage, cue-once behavior, tap-once retrieval, stale/replay/unknown and quiet paths, and reads a synthetic JSONL touch event with the documented fields (`event_type`, `subtype`, `duration_ms`, `ts`, `ts_unix`, `session_id`). It also exercises the public publish/claim CLI and the real `serve_fetch` handler with an in-memory firmware stream: empty before publication, fixed synthetic PCM with matching length/CRC and a simulated played receipt after publication, then empty after consumption. A provider exception is asserted to produce `TAP_FAIL`, never `TAP_NONE`. All event and PCM fixtures are synthetic; no provider, sensor, room monitoring, network, service, or physical hardware is used.
 
 ## Manual host-only flow
 
