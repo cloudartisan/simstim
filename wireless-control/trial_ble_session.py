@@ -1,6 +1,7 @@
 """One live BLE session, checked around each command. Never replay an action."""
 import argparse, time
 from cli import request_once, OPSOCK
+import service
 
 REQUEST_TIMEOUTS = {'wifi-suspend': 45, 'wifi-resume': 45, 'frame': 330,
                     'survey': 630, 'observe': 850}

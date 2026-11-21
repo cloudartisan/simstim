@@ -45,24 +45,38 @@ class Regression(unittest.TestCase):
         c=service.Control()
         with self.assertRaises(service.WirelessError): c._submit('left')
         self.assertTrue(c.pending.empty())
-    def test_authenticated_ble_diagnostic_command_is_read_only_and_survives_reconnect(self):
+    def test_authenticated_ble_diagnostic_command_parses_legacy_and_extended_lines(self):
         c=service.Control()
         class DiagnosticPeer:
-            def __init__(self): self.writes=[]
+            def __init__(self, lines): self.lines=list(lines); self.writes=[]
             def write(self,value): self.writes.append(value)
-        peer=DiagnosticPeer()
-        c._expect=lambda *_args,**_kwargs: 'SIMSTIM_BLE_DIAG generation=7 cause=gap gap=19 rc=0 tx=4096 rx=2048 fragment_reject=2'
+            def readline(self, **_kwargs): return self.lines.pop(0).encode("ascii")+b"\n"
+        legacy='SIMSTIM_BLE_DIAG generation=7 cause=gap gap=19 rc=0 tx=4096 rx=2048 fragment_reject=2'
+        extended='SIMSTIM_BLE_DIAG generation=8 cause=write gap=0 rc=13 tx=64 rx=24 fragment_reject=0 write_acks=123 write_seq=65535 write_rc=-7'
+        peer=DiagnosticPeer([legacy,extended])
         result=c.execute(peer,'ble-diagnostics')
         self.assertEqual(peer.writes,[b'BLE_DIAGNOSTICS\n'])
         self.assertEqual(result,{'generation':7,'first_cause':'gap','gap_reason':19,
                                  'low_level_return':0,'tx_bytes':4096,'rx_bytes':2048,
                                  'fragment_rejections':2})
-        c._expect=lambda *_args,**_kwargs: 'SIMSTIM_BLE_DIAG generation=8 cause=write gap=0 rc=13 tx=64 rx=24 fragment_reject=0'
         result=c.execute(peer,'ble-diagnostics')
-        self.assertEqual((result['generation'],result['first_cause'],result['low_level_return']),(8,'write',13))
+        self.assertEqual(result,{'generation':8,'first_cause':'write','gap_reason':0,
+                                 'low_level_return':13,'tx_bytes':64,'rx_bytes':24,
+                                 'fragment_rejections':0,'write_acks':123,
+                                 'write_seq':65535,'write_rc':-7})
         c.connected=False
         self.assertEqual(c.status()['last_ble_diagnostic'],result)
         with self.assertRaises(service.WirelessError): c._submit('ble-diagnostics')
+
+    def test_ble_diagnostic_rejects_suffixes_and_out_of_range_counters(self):
+        base='SIMSTIM_BLE_DIAG generation=8 cause=write gap=0 rc=13 tx=64 rx=24 fragment_reject=0'
+        for line in (base+' trailing', base+' write_acks=1 write_seq=65536 write_rc=0',
+                     base+' write_acks=4294967296 write_seq=0 write_rc=0',
+                     base+' write_acks=1 write_seq=0 write_rc=0 extra=1', base+'x'):
+            with self.subTest(line=line):
+                peer=type('Peer',(),{'write':lambda self,_data:None,
+                                     'readline':lambda self,**_kwargs:line.encode()+b'\n'})()
+                with self.assertRaises(service.WirelessError): service.Control().execute(peer,'ble-diagnostics')
     def test_single_positive_tap_claim(self):
         with tempfile.TemporaryDirectory() as d:
             p=Path(d)/'state.json';p.write_text(json.dumps({'schema':1,'items':{'brief':{'summary':'Ready.','status':'pending','created_at':time.time(),'reviewed':True}}}));peer=Peer()

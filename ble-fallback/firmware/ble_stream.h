@@ -28,6 +28,9 @@ typedef struct {
     int32_t gap_reason;
     int32_t low_level_return;
     uint32_t tx_bytes, rx_bytes, fragment_rejections;
+    uint32_t tx_write_acks;
+    uint16_t tx_write_last_sequence;
+    int32_t tx_write_last_result;
 } simstim_ble_diagnostic_t;
 
 /* One TLS byte stream over a pre-provisioned BLE peer. No scan API is exposed. */
@@ -61,6 +64,9 @@ void simstim_ble_stream_begin_generation(simstim_ble_stream_t *s);
 void simstim_ble_stream_record_failure(simstim_ble_stream_t *s,
                                        simstim_ble_close_cause_t cause,
                                        int32_t detail);
+/* Bounded uplink write metadata only; never records frame contents. */
+void simstim_ble_stream_record_write(simstim_ble_stream_t *s,
+                                     uint16_t sequence, int32_t result);
 void simstim_ble_stream_disconnect(simstim_ble_stream_t *s, int32_t gap_reason);
 /* Read-only allowlisted line. Caller supplies true only inside an authenticated control session. */
 int simstim_ble_diagnostic_read(const simstim_ble_stream_t *s,

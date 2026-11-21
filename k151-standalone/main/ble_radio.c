@@ -176,9 +176,22 @@ static int flush_one_frame(void)
     }
     int rc=ack_step(&uplink,xTaskGetTickCount(),pdMS_TO_TICKS(8000),staged_frame,staged_len,
                     submit_uplink,NULL,BLE_HS_EBUSY,BLE_HS_ENOMEM,BLE_HS_ETIMEOUT);
-    if(rc==0) return 0;
-    if(rc>0){ radio_stream.tx_next_sequence++; staged_len=0; return 1; }
+    if(rc==0){
+        if(uplink.active){
+            xSemaphoreTake(stream_lock,portMAX_DELAY);
+            simstim_ble_stream_record_write(&radio_stream,staged_sequence,INT_MIN);
+            xSemaphoreGive(stream_lock);
+        }
+        return 0;
+    }
+    if(rc>0){
+        xSemaphoreTake(stream_lock,portMAX_DELAY);
+        simstim_ble_stream_record_write(&radio_stream,staged_sequence,0);
+        xSemaphoreGive(stream_lock);
+        radio_stream.tx_next_sequence++; staged_len=0; return 1;
+    }
     xSemaphoreTake(stream_lock,portMAX_DELAY);
+    simstim_ble_stream_record_write(&radio_stream,staged_sequence,uplink.reason);
     simstim_ble_stream_record_failure(&radio_stream,SIMSTIM_BLE_CLOSE_WRITE,uplink.reason);
     xSemaphoreGive(stream_lock);
     xEventGroupSetBits(radio_events, RADIO_FAILED);

@@ -68,6 +68,9 @@ class SharedControl(service.Control):
         result["transport"] = (self._owner or "disconnected") if authenticated else "disconnected"
         result["generation"] = self.generation
         result["diagnostics"] = dict(self.diagnostics)
+        bridge = getattr(getattr(self, "_ble_owner", None), "bridge", None)
+        if bridge is not None:
+            result["diagnostics"].update(bridge.safe_diagnostics())
         return result
 
     def _resume_wifi(self):
@@ -104,9 +107,13 @@ class SharedControl(service.Control):
             self._resume_wifi()
             return {"ok": True, "wifi_accept": "enabled", "scope": "this process listener only"}
         if command == "diagnostics":
+            diagnostics = dict(self.diagnostics)
+            bridge = getattr(getattr(self, "_ble_owner", None), "bridge", None)
+            if bridge is not None:
+                diagnostics.update(bridge.safe_diagnostics())
             return {"owner": self._owner, "generation": self.generation,
                     "wifi_accept": "enabled" if self.wifi_accept_enabled else "suspended",
-                    "diagnostics": dict(self.diagnostics)}
+                    "diagnostics": diagnostics}
         if timeout is None:
             timeout = service.OPERATION_TIMEOUTS.get(command, 35) if self._owner == "ble" else 35
         return super()._submit(command, timeout)
@@ -188,6 +195,7 @@ async def serve(adapter: str, *, key_path: Path, operator_path: Path, state_path
     ad_path = "/org/portable/device_gateway/advertisement0"
     try:
         objects, owner, up_q, down_q, notify_worker = bluez_gatt.create_application(control=control, tls=tls)
+        control._ble_owner = owner
         disconnect_handler = await bluez_gatt.install_disconnect_watcher(bus, owner, owner.bridge)
         advertisement = bluez_gatt.create_advertisement()
         bus.export(ad_path, advertisement)

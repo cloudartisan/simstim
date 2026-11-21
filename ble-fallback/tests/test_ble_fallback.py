@@ -182,19 +182,118 @@ class BleFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(TLSControlBridge._error_label(RuntimeError("private payload text")),
                          "RuntimeError")
 
+    async def test_failed_generation_survives_disconnect_and_reconnect_in_real_status(self):
+        from bluez_gatt import Owner, BoundedByteQueue
+
+        class WaitingTLS:
+            def __init__(self): self.entered = threading.Event(); self.release = threading.Event()
+            def wrap(self, sock):
+                self.entered.set(); self.release.wait(3)
+                raise OSError("test teardown")
+
+        class PartialThenBrokenPipe:
+            def __init__(self, sock): self.sock, self.calls = sock, 0
+            def send(self, _data):
+                self.calls += 1
+                if self.calls == 1: return 7
+                raise BrokenPipeError(32, "Broken pipe")
+            def recv(self, size): return self.sock.recv(size)
+            def shutdown(self, how): return self.sock.shutdown(how)
+            def close(self): return self.sock.close()
+
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as d:
+            control = dual_transport_daemon.SharedControl(Path(d) / "state.json")
+            owner = Owner()
+            control._ble_owner = owner
+            tls = WaitingTLS()
+            bridge = TLSControlBridge(control, tls, owner)
+            owner.bridge = bridge
+            loop = asyncio.get_running_loop()
+            uplink, downlink = BoundedByteQueue(), BoundedByteQueue()
+            await owner.acquire("old-device")
+            bridge.start("old-device", loop, uplink, downlink)
+            self.assertTrue(tls.entered.wait(1))
+            old_session = bridge._session
+            old_session.transport = PartialThenBrokenPipe(old_session.transport)
+            await uplink.put(b"private-payload-must-not-escape")
+            deadline = time.monotonic() + 2
+            while bridge.peer is not None and time.monotonic() < deadline:
+                await asyncio.sleep(.005)
+            self.assertIsNone(bridge.peer, "failed generation did not clear its session")
+            failed = control.status()["diagnostics"]
+            self.assertEqual(failed["ble_generation"], 1)
+            self.assertEqual(failed["ble_stage"], "gatt_uplink")
+            self.assertEqual(failed["ble_tx_bytes"], 7)
+            self.assertEqual(failed["ble_rx_bytes"], 0)
+            self.assertGreater(failed["ble_elapsed_ms"], 0)
+            self.assertNotIn("private-payload", repr(failed))
+            self.assertNotIn("old-device", repr(failed))
+
+            # Attach a genuine next owner/session before reading status again.
+            await asyncio.sleep(1.05)  # Owner's real one-second reconnect backoff.
+            await owner.acquire("new-device")
+            bridge.start("new-device", loop, uplink, downlink)
+            current = control.status()["diagnostics"]
+            self.assertEqual({k: current[k] for k in (
+                "ble_generation", "ble_stage", "ble_tx_bytes", "ble_rx_bytes")}, {
+                "ble_generation": 1, "ble_stage": "gatt_uplink",
+                "ble_tx_bytes": 7, "ble_rx_bytes": 0})
+            bridge.close("new-device")
+            tls.release.set()
+
+    def test_ble_acceptance_checks_staged_update_before_single_capture_attempt(self):
+        import trial_ble_session
+        calls = []
+        phase = {"transport": "wifi"}
+        pin = "a" * 64
+
+        def request_once(_socket, command, _timeout):
+            calls.append(command)
+            if command == "wifi-suspend 123":
+                phase["transport"] = "ble"
+                return {"ok": True, "result": {"ok": True}}
+            if command == "stage Regression check.":
+                return {"ok": True, "result": {"ok": True, "receipt": "UPDATE_STATUS bytes=320 crc=deadbeef"}}
+            if command == "frame":
+                raise TimeoutError("capture reply ambiguous")
+            if command == "wifi-resume":
+                return {"ok": True, "result": {"ok": True}}
+            return {"ok": True, "result": {
+                "ok": True, "peer_identity": service.IDENTITY,
+                "device_elf_sha256": pin, "transport": phase["transport"],
+                "generation": 4, "uptime_s": 10}}
+
+        with (patch.object(trial_ble_session, "wifi_suspend_budget", return_value=123),
+              patch.object(trial_ble_session, "request_once", side_effect=request_once)):
+            with self.assertRaisesRegex(TimeoutError, "capture reply ambiguous"):
+                trial_ble_session.run(pin, ["stage Regression check.", "frame"])
+        self.assertLess(calls.index("stage Regression check."), calls.index("frame"))
+        self.assertEqual(calls.count("frame"), 1, "ambiguous capture must never be replayed")
+        self.assertEqual(calls[-1], "wifi-resume")
+
     def test_ble_disconnect_keeps_generation_first_cause_and_stage(self):
         from types import SimpleNamespace
-        bridge = TLSControlBridge(object(), object())
+        import time
+        control = SimpleNamespace(diagnostics={"ble_mtu": 185, "ble_fragment_limit": 178})
+        bridge = TLSControlBridge(control, object())
         bridge._active_diagnostic = {"generation": 9, "first_cause": None,
                                      "stage": None, "detail": None,
                                      "tx_bytes": 120, "rx_bytes": 80}
-        session = SimpleNamespace(generation=9)
+        session = SimpleNamespace(generation=9, started_monotonic=time.monotonic() - 0.01)
         bridge._record_failure(session, "tls_downlink", "peer_eof")
         bridge._record_failure(session, "bluez_disconnect", "bluez_connected_false")
-        self.assertEqual(bridge.last_failed, {
+        self.assertEqual({k: v for k, v in bridge.last_failed.items() if k != "elapsed_ms"}, {
             "generation": 9, "first_cause": "peer_eof", "stage": "tls_downlink",
             "detail": "peer_eof", "tx_bytes": 120, "rx_bytes": 80})
         self.assertEqual(bridge.last_error, "peer_eof")
+        self.assertEqual(set(bridge.safe_diagnostics()), {
+            "ble_generation", "ble_stage", "ble_tx_bytes", "ble_rx_bytes",
+            "ble_elapsed_ms", "ble_mtu", "ble_fragment_limit"})
+        self.assertEqual({k: v for k, v in bridge.safe_diagnostics().items()
+                          if k != "ble_elapsed_ms"}, {
+            "ble_generation": 9, "ble_stage": "tls_downlink", "ble_tx_bytes": 120,
+            "ble_rx_bytes": 80, "ble_mtu": 185, "ble_fragment_limit": 178})
+        self.assertGreaterEqual(bridge.safe_diagnostics()["ble_elapsed_ms"], 0)
 
     async def test_real_tls_bridge_large_bidirectional_stream_at_negotiated_mtus(self):
         key = bytes(range(32))

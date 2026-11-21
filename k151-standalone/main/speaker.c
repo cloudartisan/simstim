@@ -87,7 +87,7 @@ static void dispatch_look(i2c_master_bus_handle_t bus,const char *cmd){
  if(!strcmp(cmd,"TOUCH_STATUS")){uint8_t status=0;bool valid=rd(touch,2,&status,1);wire_printf("TOUCH %s %u\n",valid?(status?"PRESSED":"RELEASED"):"ERROR",valid?(unsigned)status:0);fflush(stdout);return;}
  if(!strcmp(cmd,"PROX_STATUS")){extern bool board_proximity_status(uint16_t*,bool*);uint16_t count=0;bool saturated=false;bool valid=board_proximity_status(&count,&saturated);wire_printf("PROX %s %u %u\n",valid?"OK":"ERROR",(unsigned)count,(unsigned)saturated);fflush(stdout);return;}
  if(!strcmp(cmd,"BLE_DIAGNOSTICS")){
-    char line[192];
+    char line[256];
 #if CONFIG_BT_NIMBLE_ENABLED
     int n=ble_radio_diagnostic_line(wire_owner()==WIRE_WIFI,line,sizeof(line));
 #else

@@ -41,6 +41,35 @@ OPERATION_TIMEOUTS = {"frame": FRAME_DEADLINE_S + OPERATOR_MARGIN_S,
                       "survey": SURVEY_DEADLINE_S + OPERATOR_MARGIN_S,
                       "observe": OBSERVE_DEADLINE_S + OPERATOR_MARGIN_S}
 COMMANDS = {"status": "STATUS", "touch": "TOUCH_STATUS", "prox": "PROX_STATUS", "probe": "LOOK_PROBE", "home": "LOOK_HOME", "left": "LOOK_LEFT", "right": "LOOK_RIGHT", "up": "LOOK_UP", "down": "LOOK_DOWN", "frame": "LOOK_FRAME", "survey": "LOOK_SURVEY", "ble-diagnostics": "BLE_DIAGNOSTICS"}
+BLE_DIAG_LEGACY = re.compile(r"SIMSTIM_BLE_DIAG generation=(\d{1,10}) cause=(gap|tls|return|fragment|tx|rx|write|unknown) gap=(-?\d{1,11}) rc=(-?\d{1,11}) tx=(\d{1,10}) rx=(\d{1,10}) fragment_reject=(\d{1,10})")
+BLE_DIAG_EXTENDED = re.compile(r"SIMSTIM_BLE_DIAG generation=(\d{1,10}) cause=(gap|tls|return|fragment|tx|rx|write|unknown) gap=(-?\d{1,11}) rc=(-?\d{1,11}) tx=(\d{1,10}) rx=(\d{1,10}) fragment_reject=(\d{1,10}) write_acks=(\d{1,10}) write_seq=(\d{1,5}) write_rc=(-?\d{1,11})")
+
+
+def _parse_ble_diagnostic(line):
+    """Parse exactly the legacy or extended bounded firmware diagnostic record."""
+    match = BLE_DIAG_EXTENDED.fullmatch(line)
+    extended = match is not None
+    if match is None:
+        match = BLE_DIAG_LEGACY.fullmatch(line)
+    if match is None:
+        raise WirelessError("malformed BLE diagnostic line")
+    groups = match.groups()
+    generation, cause, gap, rc, tx, rx, rejects = groups[:7]
+    generation, gap, rc, tx, rx, rejects = map(int, (generation, gap, rc, tx, rx, rejects))
+    bounds = ((generation, 0, 0xffffffff), (gap, -0x80000000, 0x7fffffff),
+              (rc, -0x80000000, 0x7fffffff), (tx, 0, 0xffffffff),
+              (rx, 0, 0xffffffff), (rejects, 0, 0xffffffff))
+    if any(not low <= value <= high for value, low, high in bounds):
+        raise WirelessError("BLE diagnostic value out of range")
+    keys = ("generation", "first_cause", "gap_reason", "low_level_return", "tx_bytes", "rx_bytes", "fragment_rejections")
+    values = [generation, cause, gap, rc, tx, rx, rejects]
+    if extended:
+        acks, sequence, write_rc = map(int, groups[7:])
+        if acks > 0xffffffff or sequence > 0xffff or not -0x80000000 <= write_rc <= 0x7fffffff:
+            raise WirelessError("BLE diagnostic value out of range")
+        keys += ("write_acks", "write_seq", "write_rc")
+        values.extend((acks, sequence, write_rc))
+    return dict(zip(keys, values))
 
 class WirelessError(Exception): pass
 
@@ -213,12 +242,7 @@ class Control:
             if line=="SIMSTIM_BLE_DIAG available=0":
                 self.last_ble_diagnostic={"available":False}
                 return dict(self.last_ble_diagnostic)
-            match=re.fullmatch(r"SIMSTIM_BLE_DIAG generation=(\d+) cause=(gap|tls|return|fragment|tx|rx|write|unknown) gap=(-?\d+) rc=(-?\d+) tx=(\d+) rx=(\d+) fragment_reject=(\d+)",line)
-            if not match:
-                raise WirelessError("malformed BLE diagnostic line")
-            keys=("generation","first_cause","gap_reason","low_level_return","tx_bytes","rx_bytes","fragment_rejections")
-            values=(int(match.group(1)),match.group(2),int(match.group(3)),int(match.group(4)),int(match.group(5)),int(match.group(6)),int(match.group(7)))
-            self.last_ble_diagnostic=dict(zip(keys,values))
+            self.last_ble_diagnostic=_parse_ble_diagnostic(line)
             return dict(self.last_ble_diagnostic)
         if command=="status":
             for k,v in (("touch","TOUCH_STATUS"),("prox","PROX_STATUS")):

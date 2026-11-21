@@ -39,6 +39,13 @@ void simstim_ble_stream_record_failure(simstim_ble_stream_t *s,
     if (cause == SIMSTIM_BLE_CLOSE_GAP) s->current_diagnostic.gap_reason = detail;
     else s->current_diagnostic.low_level_return = detail;
 }
+void simstim_ble_stream_record_write(simstim_ble_stream_t *s,
+                                     uint16_t sequence, int32_t result) {
+    if (!s) return;
+    s->current_diagnostic.tx_write_last_sequence = sequence;
+    s->current_diagnostic.tx_write_last_result = result;
+    if (result == 0) ++s->current_diagnostic.tx_write_acks;
+}
 size_t simstim_ble_stream_write(simstim_ble_stream_t *s, const void *data, size_t len) {
     if (!s || !data || !s->connected || !len) return 0;
     size_t n = put(s->tx, &s->tx_head, &s->tx_tail, data, len);
@@ -96,9 +103,10 @@ int simstim_ble_diagnostic_read(const simstim_ble_stream_t *s, bool transport_au
     case SIMSTIM_BLE_CLOSE_WRITE: cause = "write"; break;
     default: break;
     }
-    int n = snprintf(out, cap, "SIMSTIM_BLE_DIAG generation=%lu cause=%s gap=%ld rc=%ld tx=%lu rx=%lu fragment_reject=%lu\n",
+    int n = snprintf(out, cap, "SIMSTIM_BLE_DIAG generation=%lu cause=%s gap=%ld rc=%ld tx=%lu rx=%lu fragment_reject=%lu write_acks=%lu write_seq=%u write_rc=%ld\n",
         (unsigned long)d->generation, cause, (long)d->gap_reason, (long)d->low_level_return,
         (unsigned long)d->tx_bytes, (unsigned long)d->rx_bytes,
-        (unsigned long)d->fragment_rejections);
+        (unsigned long)d->fragment_rejections, (unsigned long)d->tx_write_acks,
+        (unsigned)d->tx_write_last_sequence, (long)d->tx_write_last_result);
     return n > 0 && (size_t)n < cap ? n : 0;
 }

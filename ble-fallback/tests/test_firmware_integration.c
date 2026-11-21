@@ -17,7 +17,8 @@ int main(void) {
  assert(ssl.recv_cb(ssl.ctx,out,sizeof(out))==MBEDTLS_ERR_SSL_WANT_READ);
  assert(simstim_ble_stream_ingress(&stream,in,6)==6); assert(ssl.recv_cb(ssl.ctx,out,sizeof(out))==6); assert(!memcmp(in,out,6));
  assert(simstim_ble_tls_bio_handshake(&ssl,&stream)==0); assert(stream.authenticated);
- char diagnostic[192];
+ char diagnostic[256];
+ simstim_ble_stream_record_write(&stream,41,0);
  simstim_ble_stream_record_failure(&stream,SIMSTIM_BLE_CLOSE_TLS,-0x1234);
  simstim_ble_stream_disconnect(&stream,0x13); assert(!stream.authenticated);
  assert(simstim_ble_diagnostic_read(&stream,false,diagnostic,sizeof(diagnostic))==0);
@@ -27,6 +28,7 @@ int main(void) {
  assert(simstim_ble_diagnostic_read(&stream,true,diagnostic,sizeof(diagnostic))>0);
  assert(strstr(diagnostic,"generation=1 cause=tls gap=0 rc=-4660")!=NULL);
  assert(strstr(diagnostic," tx=6 rx=6 fragment_reject=0")!=NULL);
+ assert(strstr(diagnostic,"write_acks=1 write_seq=41 write_rc=0")!=NULL);
  simstim_ble_stream_record_failure(&stream,SIMSTIM_BLE_CLOSE_GAP,0x08);
  simstim_ble_stream_disconnect(&stream,0x08);
  assert(simstim_ble_diagnostic_read(&stream,false,diagnostic,sizeof(diagnostic))==0);

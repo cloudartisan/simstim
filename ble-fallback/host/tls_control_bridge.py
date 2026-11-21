@@ -9,6 +9,7 @@ import asyncio
 import os
 import socket
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -22,6 +23,7 @@ class _Session:
     server: socket.socket
     transport: socket.socket
     generation: int
+    started_monotonic: float = field(default_factory=time.monotonic)
     stop: threading.Event = field(default_factory=threading.Event)
     workers: list[threading.Thread] = field(default_factory=list)
 
@@ -51,6 +53,39 @@ class TLSControlBridge:
         """Compatibility/read-only view used by teardown tests."""
         with self._lock:
             return list(self._session.workers) if self._session else []
+
+    def safe_diagnostics(self) -> dict[str, int | str]:
+        """Return only allowlisted transfer stage, counters, MTU and duration."""
+        with self._lock:
+            session = self._session
+            failed = self.last_failed or {}
+            active = self._active_diagnostic or {}
+            # A reconnect must not hide the last failed generation before an
+            # operator has had a chance to read its evidence.
+            snapshot = failed if failed else active
+            generation = snapshot.get("generation", self._generation)
+            stage = snapshot.get("stage")
+            allowed_stages = {"tls_or_control", "gatt_uplink", "tls_downlink",
+                              "gatt_downlink", "bluez_disconnect"}
+            duration = snapshot.get("elapsed_ms")
+            if session is not None and session.generation == generation:
+                duration = max(0, int((time.monotonic() - session.started_monotonic) * 1000))
+            if not isinstance(duration, int):
+                duration = 0
+            tx = snapshot.get("tx_bytes", 0)
+            rx = snapshot.get("rx_bytes", 0)
+            transport = getattr(self.control, "diagnostics", {})
+            mtu = transport.get("ble_mtu", 23) if isinstance(transport, dict) else 23
+            frag = transport.get("ble_fragment_limit", 16) if isinstance(transport, dict) else 16
+            return {
+                "ble_generation": generation if isinstance(generation, int) else 0,
+                "ble_stage": stage if isinstance(stage, str) and stage in allowed_stages else "none",
+                "ble_tx_bytes": tx if isinstance(tx, int) else 0,
+                "ble_rx_bytes": rx if isinstance(rx, int) else 0,
+                "ble_elapsed_ms": duration,
+                "ble_mtu": mtu if isinstance(mtu, int) else 23,
+                "ble_fragment_limit": frag if isinstance(frag, int) else 16,
+            }
 
     def start(self, peer: str, loop: asyncio.AbstractEventLoop,
               uplink: asyncio.Queue, downlink: asyncio.Queue) -> None:
@@ -144,7 +179,8 @@ class TLSControlBridge:
         raise ConnectionError("GATT/TLS session stopped")
 
     @staticmethod
-    def _send_chunk(session: _Session, chunk: bytes, stall_limit: float = 15.0) -> None:
+    def _send_chunk(session: _Session, chunk: bytes, stall_limit: float = 15.0,
+                    on_progress=None) -> None:
         """Drain one ciphertext chunk without replaying a prefix after backpressure."""
         import time
         pending = memoryview(chunk)
@@ -161,6 +197,8 @@ class TLSControlBridge:
             if not n:
                 raise BrokenPipeError('uplink closed')
             pending = pending[n:]
+            if on_progress is not None:
+                on_progress(n)
             last_progress = time.monotonic()
 
     def _record_failure(self, session: _Session, stage: str, exc: Exception | str) -> None:
@@ -171,6 +209,7 @@ class TLSControlBridge:
             current["stage"] = stage
             current["first_cause"] = self._error_label(exc) if isinstance(exc, Exception) else str(exc)
             current["detail"] = current["first_cause"]
+            current["elapsed_ms"] = max(0, int((time.monotonic() - session.started_monotonic) * 1000))
             self.last_error = current["first_cause"]
             self.last_failed = dict(current)
 
@@ -179,10 +218,12 @@ class TLSControlBridge:
             future = asyncio.run_coroutine_threadsafe(session.uplink.take(512), session.loop)
             try:
                 chunk = self._wait_future(session, future)
-                self._send_chunk(session, chunk)
-                with self._lock:
-                    if self._active_diagnostic and self._active_diagnostic["generation"] == session.generation:
-                        self._active_diagnostic["tx_bytes"] += len(chunk)
+                def record_sent(count):
+                    with self._lock:
+                        current = self._active_diagnostic
+                        if current and current["generation"] == session.generation:
+                            current["tx_bytes"] += count
+                self._send_chunk(session, chunk, on_progress=record_sent)
             except Exception as exc:
                 if not session.stop.is_set():
                     self._record_failure(session, "gatt_uplink", exc)
